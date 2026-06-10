@@ -8,8 +8,10 @@ __pycache__/
 *.pyc
 *.egg-info/
 
-# data dump (derived clinical data + PII, and an 84MB tarball) — keep local only
-data/
+# data dump (derived clinical data + PII, and an 84MB tarball) — keep local only.
+# but DO commit small synthetic config like the price/inventory CSV.
+data/patient_graph/
+data/*.tar.gz
 
 # os / editor
 .DS_Store

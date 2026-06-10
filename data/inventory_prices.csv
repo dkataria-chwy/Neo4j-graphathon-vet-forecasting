@@ -1,0 +1,70 @@
+service_name,category,type,unit_price,in_stock,reorder_level
+gabapentin,Medication,consumable,18.00,140,30
+Cytopoint,Medication,consumable,82.00,22,10
+carprofen,Medication,consumable,35.00,90,20
+Simparica Trio,Medication,consumable,42.00,60,15
+trazodone,Medication,consumable,20.00,110,25
+Apoquel,Medication,consumable,55.00,48,15
+cefpodoxime,Medication,consumable,40.00,55,15
+Proviable,Medication,consumable,28.00,70,20
+Cerenia,Medication,consumable,32.00,40,12
+tresaderm,Medication,consumable,38.00,33,10
+maropitant,Medication,consumable,30.00,45,12
+famotidine,Medication,consumable,15.00,120,30
+Bordetella vaccine,Medication,consumable,35.00,30,10
+Librela,Medication,consumable,75.00,18,8
+prednisone,Medication,consumable,16.00,130,30
+lactated Ringer's solution,Medication,consumable,45.00,40,12
+pyrantel,Medication,consumable,18.00,80,20
+Surolan otic solution,Medication,consumable,40.00,28,10
+ear cytology,DiagnosticTest,service,38.00,,
+fecal examination,DiagnosticTest,service,42.00,,
+heartworm test,DiagnosticTest,service,40.00,,
+fecal flotation,DiagnosticTest,service,38.00,,
+urinalysis,DiagnosticTest,service,45.00,,
+4dx,DiagnosticTest,service,48.00,,
+fluorescein stain,DiagnosticTest,service,32.00,,
+skin cytology,DiagnosticTest,service,42.00,,
+blood work,DiagnosticTest,service,95.00,,
+senior wellness bloodwork,DiagnosticTest,service,140.00,,
+CBC,DiagnosticTest,service,65.00,,
+ear swab,DiagnosticTest,service,30.00,,
+adult wellness bloodwork,DiagnosticTest,service,110.00,,
+Schirmer tear test,DiagnosticTest,service,28.00,,
+blood pressure measurement,DiagnosticTest,service,35.00,,
+abdominal ultrasound,Imaging,service,225.00,,
+radiographs,Imaging,service,150.00,,
+abdominal radiographs,Imaging,service,165.00,,
+thoracic radiographs,Imaging,service,165.00,,
+dental radiographs,Imaging,service,95.00,,
+chest radiographs,Imaging,service,165.00,,
+echocardiogram,Imaging,service,350.00,,
+ultrasound bladder,Imaging,service,140.00,,
+AFAST abdomen,Imaging,service,120.00,,
+full mouth dental radiographs,Imaging,service,120.00,,
+anal gland expression,TreatmentProcedure,service,32.00,,
+ear cleaning,TreatmentProcedure,service,35.00,,
+trim nails,TreatmentProcedure,service,22.00,,
+spay ovariohysterectomy,TreatmentProcedure,service,320.00,,
+suture removal,TreatmentProcedure,service,25.00,,
+subcutaneous fluids,TreatmentProcedure,service,40.00,,
+Neutering,TreatmentProcedure,service,250.00,,
+dental_prophylaxis_cohat,TreatmentProcedure,service,450.00,,
+dental cleaning,TreatmentProcedure,service,400.00,,
+laser therapy,TreatmentProcedure,service,45.00,,
+rabies vaccination,TreatmentProcedure,service,28.00,,
+Librela injection,TreatmentProcedure,service,75.00,,
+mass removals,TreatmentProcedure,service,380.00,,
+dental extraction,TreatmentProcedure,service,120.00,,
+Adequan injection,TreatmentProcedure,service,40.00,,
+cystocentesis,DiagnosticProcedure,service,45.00,,
+US-guided cystocentesis,DiagnosticProcedure,service,65.00,,
+fine needle aspirate,DiagnosticProcedure,service,85.00,,
+histopathology,DiagnosticProcedure,service,150.00,,
+rectal exam,DiagnosticProcedure,service,30.00,,
+venipuncture,DiagnosticProcedure,service,20.00,,
+__DEFAULT_Medication,Medication,consumable,28.00,50,15
+__DEFAULT_DiagnosticTest,DiagnosticTest,service,45.00,,
+__DEFAULT_Imaging,Imaging,service,165.00,,
+__DEFAULT_TreatmentProcedure,TreatmentProcedure,service,140.00,,
+__DEFAULT_DiagnosticProcedure,DiagnosticProcedure,service,110.00,,
