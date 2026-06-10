@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "neo4j": {
+      "command": "<ABSOLUTE_PATH_TO>/.venv/bin/neo4j-mcp-server",
+      "env": {
+        "NEO4J_URI": "neo4j+s://<dbid>.databases.neo4j.io",
+        "NEO4J_USERNAME": "neo4j",
+        "NEO4J_PASSWORD": "<password>",
+        "NEO4J_DATABASE": "neo4j",
+        "NEO4J_READ_ONLY": "false"
+      }
+    }
+  }
+}

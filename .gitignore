@@ -1,0 +1,17 @@
+# secrets & local machine config — never commit
+.env
+.mcp.json
+
+# python
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+
+# data dump (derived clinical data + PII, and an 84MB tarball) — keep local only
+data/
+
+# os / editor
+.DS_Store
+.idea/
+.vscode/
