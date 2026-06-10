@@ -13,6 +13,9 @@ __pycache__/
 data/patient_graph/
 data/*.tar.gz
 
+# generated forecast output (regenerable; may contain pet names)
+out/
+
 # os / editor
 .DS_Store
 .idea/
