@@ -1,0 +1,8 @@
+neo4j>=5.20.0
+python-dotenv>=1.0.1
+streamlit>=1.36.0
+pandas>=2.2.0
+streamlit-agraph>=0.0.45
+starlette>=0.37.0
+uvicorn>=0.30.0
+playwright>=1.44.0
