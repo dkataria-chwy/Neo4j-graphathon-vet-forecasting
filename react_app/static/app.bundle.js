@@ -1,3 +1,5 @@
+"use strict";
+
 function _typeof(o) { "@babel/helpers - typeof"; return _typeof = "function" == typeof Symbol && "symbol" == typeof Symbol.iterator ? function (o) { return typeof o; } : function (o) { return o && "function" == typeof Symbol && o.constructor === Symbol && o !== Symbol.prototype ? "symbol" : typeof o; }, _typeof(o); }
 function _toConsumableArray(r) { return _arrayWithoutHoles(r) || _iterableToArray(r) || _unsupportedIterableToArray(r) || _nonIterableSpread(); }
 function _nonIterableSpread() { throw new TypeError("Invalid attempt to spread non-iterable instance.\nIn order to be iterable, non-array objects must have a [Symbol.iterator]() method."); }
@@ -26,9 +28,10 @@ var emptyMetrics = {
   medications: 0,
   quantityNeeded: 0,
   kgEvidence: 0,
-  noiseFloor: 3,
-  graphNodes: 0,
-  graphRelationships: 0,
+  chargeLines: 0,
+  expectedTotalCost: 0,
+  forecastVisits: 0,
+  fourWeekStockItems: 0,
   database: "neo4j"
 };
 var defaultVendors = ["Amazon", "Chewy", "Covetrus", "MWI", "Patterson", "Med-Vet International", "Use KG supplier"];
@@ -36,6 +39,14 @@ function todayPlus(days) {
   var value = new Date();
   value.setDate(value.getDate() + days);
   return value.toISOString().slice(0, 10);
+}
+function money(value) {
+  var number = Number(value || 0);
+  if (!Number.isFinite(number)) return "$0.00";
+  return number.toLocaleString("en-US", {
+    style: "currency",
+    currency: "USD"
+  });
 }
 function downloadBlob(blob, filename) {
   var url = URL.createObjectURL(blob);
@@ -47,42 +58,36 @@ function downloadBlob(blob, filename) {
   link.remove();
   URL.revokeObjectURL(url);
 }
-function fileStem(filters) {
-  var vendor = (filters.vendor || "Amazon").toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
-  return "florida_plantation_medication_inventory_".concat(vendor || "vendor", "_").concat(filters.appointmentDate || todayPlus(7));
+function fileStem(filters, payload) {
+  var vendor = (filters.vendor || "vendor").toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
+  var period = (payload.appointmentDate || "all_future").replace(/[^a-z0-9]+/gi, "_").replace(/^_|_$/g, "");
+  return "florida_plantation_inventory_".concat(vendor, "_").concat(period);
 }
 function App() {
-  var _bootstrap$lifeStages, _bootstrap$lifeStages2, _payload$inventory, _payload$inventory2, _cartResult$results;
+  var _payload$inventory, _bootstrap$forecastOp, _cartResult$results;
   var _useState = useState(null),
     _useState2 = _slicedToArray(_useState, 2),
     bootstrap = _useState2[0],
     setBootstrap = _useState2[1];
   var _useState3 = useState({
-      appointmentReason: "vomiting",
-      appointmentDate: todayPlus(7),
-      historyStart: "",
-      historyEnd: "",
-      maxSimilar: 80,
-      species: "all",
-      lifeStage: "all",
-      forecastScope: "whole_episode",
-      includeProcedural: false,
-      minCases: 3,
-      vendor: "Amazon"
+      vendor: "Med-Vet International"
     }),
     _useState4 = _slicedToArray(_useState3, 2),
     filters = _useState4[0],
     setFilters = _useState4[1];
   var _useState5 = useState({
       clinicName: "Florida Plantation Clinic",
+      forecastOptions: [],
       inventory: [],
-      similarAppointments: [],
-      medicationEvidence: [],
+      vendorInvoice: [],
+      chargeLines: [],
+      inventoryRollup: [],
+      evidenceTrail: [],
       provenance: [],
       forecastRules: [],
       metrics: emptyMetrics,
       purchaseDate: todayPlus(5),
-      vendor: "Amazon",
+      vendor: "Med-Vet International",
       vendorOptions: defaultVendors
     }),
     _useState6 = _slicedToArray(_useState5, 2),
@@ -118,7 +123,7 @@ function App() {
     setCartResult = _useState20[1];
   var _useState21 = useState([{
       role: "assistant",
-      content: "Ask about medication quantities, suppliers, price gaps, or why a medication is on the sheet."
+      content: "Ask why a medication is on the sheet, which past visits support it, or what needs to be ordered."
     }]),
     _useState22 = _slicedToArray(_useState21, 2),
     messages = _useState22[0],
@@ -126,7 +131,21 @@ function App() {
   var requestFilters = useMemo(function () {
     return filters;
   }, [filters]);
-  var availableLifeStages = (bootstrap === null || bootstrap === void 0 || (_bootstrap$lifeStages = bootstrap.lifeStages) === null || _bootstrap$lifeStages === void 0 ? void 0 : _bootstrap$lifeStages[filters.species]) || (bootstrap === null || bootstrap === void 0 || (_bootstrap$lifeStages2 = bootstrap.lifeStages) === null || _bootstrap$lifeStages2 === void 0 ? void 0 : _bootstrap$lifeStages2.all) || ["all"];
+  var metrics = payload.metrics || emptyMetrics;
+  var vendorOptions = payload.vendorOptions || (bootstrap === null || bootstrap === void 0 ? void 0 : bootstrap.vendorOptions) || defaultVendors;
+  var hasRows = ((_payload$inventory = payload.inventory) === null || _payload$inventory === void 0 ? void 0 : _payload$inventory.length) > 0;
+  var selectedVendor = payload.vendor || filters.vendor || "Med-Vet International";
+  var vendorInvoice = payload.vendorInvoice || [];
+  var vendorPreview = vendorInvoice.slice(0, 3);
+  var forecastCount = metrics.forecastVisits || (bootstrap === null || bootstrap === void 0 || (_bootstrap$forecastOp = bootstrap.forecastOptions) === null || _bootstrap$forecastOp === void 0 ? void 0 : _bootstrap$forecastOp.length) || 0;
+  var forecastPeriod = payload.appointmentDate || "".concat((bootstrap === null || bootstrap === void 0 ? void 0 : bootstrap.minHistoryDate) || "", " to ").concat((bootstrap === null || bootstrap === void 0 ? void 0 : bootstrap.maxHistoryDate) || "");
+  var cartStatusLabel = {
+    cart_complete: "Cart complete",
+    cart_partial: "Cart partially complete",
+    cart_stopped: "Cart stopped",
+    draft_ready: "Cart draft ready",
+    manual_review: "Manual review"
+  }[cartResult === null || cartResult === void 0 ? void 0 : cartResult.status] || "Cart update";
   function loadBootstrap() {
     return _loadBootstrap.apply(this, arguments);
   }
@@ -144,7 +163,7 @@ function App() {
               _context.next = 5;
               break;
             }
-            throw new Error("Could not load graph metadata.");
+            throw new Error("Could not load forecast metadata.");
           case 5:
             _context.next = 7;
             return response.json();
@@ -152,15 +171,8 @@ function App() {
             data = _context.sent;
             setBootstrap(data);
             setFilters(function (current) {
-              var _data$suggestions;
               return _objectSpread(_objectSpread({}, current), {}, {
-                appointmentReason: ((_data$suggestions = data.suggestions) === null || _data$suggestions === void 0 ? void 0 : _data$suggestions[0]) || current.appointmentReason,
-                appointmentDate: data.defaultAppointmentDate || current.appointmentDate,
-                historyStart: data.defaultHistoryStart || current.historyStart,
-                historyEnd: data.maxHistoryDate || current.historyEnd,
-                species: current.species || "all",
-                lifeStage: current.lifeStage || "all",
-                vendor: current.vendor || "Amazon"
+                vendor: current.vendor || "Med-Vet International"
               });
             });
           case 10:
@@ -201,7 +213,7 @@ function App() {
               _context2.next = 9;
               break;
             }
-            throw new Error("Could not build inventory sheet.");
+            throw new Error("Could not build the forecast charge sheet.");
           case 9:
             _context2.next = 11;
             return response.json();
@@ -233,16 +245,12 @@ function App() {
     });
   }, []);
   useEffect(function () {
-    if (filters.historyStart && filters.historyEnd) {
-      loadInventory(filters);
-    }
-  }, [filters.appointmentReason, filters.appointmentDate, filters.historyStart, filters.historyEnd, filters.maxSimilar, filters.species, filters.lifeStage, filters.forecastScope, filters.includeProcedural, filters.minCases, filters.vendor]);
+    loadInventory(filters);
+  }, [filters.vendor]);
   function updateFilter(name, value) {
     if (name === "vendor") setCartResult(null);
     setFilters(function (current) {
-      var next = _objectSpread(_objectSpread({}, current), {}, _defineProperty({}, name, value));
-      if (name === "species") next.lifeStage = "all";
-      return next;
+      return _objectSpread(_objectSpread({}, current), {}, _defineProperty({}, name, value));
     });
   }
   function exportSheet(_x) {
@@ -275,7 +283,7 @@ function App() {
             return response.blob();
           case 8:
             blob = _context3.sent;
-            downloadBlob(blob, "".concat(fileStem(filters), ".").concat(type === "xlsx" ? "xlsx" : type));
+            downloadBlob(blob, "".concat(fileStem(filters, payload), ".").concat(type === "xlsx" ? "xlsx" : type));
           case 10:
           case "end":
             return _context3.stop();
@@ -427,164 +435,21 @@ function App() {
     }));
     return _createVendorCart.apply(this, arguments);
   }
-  var metrics = payload.metrics || emptyMetrics;
-  var hasRows = ((_payload$inventory = payload.inventory) === null || _payload$inventory === void 0 ? void 0 : _payload$inventory.length) > 0;
-  var vendorOptions = payload.vendorOptions || (bootstrap === null || bootstrap === void 0 ? void 0 : bootstrap.vendorOptions) || defaultVendors;
-  var selectedVendor = payload.vendor || filters.vendor || "Amazon";
-  var vendorInvoice = payload.vendorInvoice || [];
-  var previewRows = vendorInvoice.slice(0, 3);
-  var cartStatusLabel = {
-    cart_complete: "Cart complete",
-    cart_partial: "Cart partially complete",
-    cart_stopped: "Cart stopped",
-    draft_ready: "Cart draft ready"
-  }[cartResult === null || cartResult === void 0 ? void 0 : cartResult.status] || "Cart update";
   return /*#__PURE__*/React.createElement("main", null, /*#__PURE__*/React.createElement("section", {
     className: "hero"
   }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
     className: "eyebrow"
-  }, payload.clinicName || "Florida Plantation Clinic"), /*#__PURE__*/React.createElement("h1", null, "Medication Inventory Tracker"), /*#__PURE__*/React.createElement("p", null, "Forecast medication inventory from future appointment complaints using the knowledge graph's clinical sign chain, cohort filters, and traceable historical medication paths.")), /*#__PURE__*/React.createElement("div", {
+  }, payload.clinicName || "Florida Plantation Clinic"), /*#__PURE__*/React.createElement("h1", null, "Forecast Charge Sheet"), /*#__PURE__*/React.createElement("p", null, "Clinic-level medication inventory from all upcoming appointments, similar historical invoices, and a KG-backed why trail.")), /*#__PURE__*/React.createElement("div", {
     className: "heroBadge"
   }, /*#__PURE__*/React.createElement("span", null, "KG"), /*#__PURE__*/React.createElement("strong", null, metrics.database || "neo4j"))), /*#__PURE__*/React.createElement("section", {
     className: "controls"
   }, /*#__PURE__*/React.createElement("div", {
     className: "controlHeading"
-  }, "Forecast setup"), /*#__PURE__*/React.createElement("div", {
-    className: "primaryControlGrid"
-  }, /*#__PURE__*/React.createElement("label", {
-    className: "wide"
-  }, "Presenting complaint", /*#__PURE__*/React.createElement("input", {
-    list: "complaintSuggestions",
-    value: filters.appointmentReason,
-    onChange: function onChange(event) {
-      return updateFilter("appointmentReason", event.target.value);
-    },
-    placeholder: "Example: vomiting, pruritus, dental calculus, wellness exam"
-  }), /*#__PURE__*/React.createElement("datalist", {
-    id: "complaintSuggestions"
-  }, ((bootstrap === null || bootstrap === void 0 ? void 0 : bootstrap.suggestions) || ["vomiting"]).map(function (suggestion) {
-    return /*#__PURE__*/React.createElement("option", {
-      key: suggestion,
-      value: suggestion
-    });
-  }))), /*#__PURE__*/React.createElement("label", null, "Species", /*#__PURE__*/React.createElement("select", {
-    value: filters.species,
-    onChange: function onChange(event) {
-      return updateFilter("species", event.target.value);
-    }
-  }, ((bootstrap === null || bootstrap === void 0 ? void 0 : bootstrap.species) || ["all", "canine", "feline"]).map(function (species) {
-    return /*#__PURE__*/React.createElement("option", {
-      key: species,
-      value: species
-    }, species === "all" ? "All species" : species);
-  }))), /*#__PURE__*/React.createElement("label", null, "Future appointment date", /*#__PURE__*/React.createElement("input", {
-    type: "date",
-    min: new Date().toISOString().slice(0, 10),
-    value: filters.appointmentDate,
-    onChange: function onChange(event) {
-      return updateFilter("appointmentDate", event.target.value);
-    }
-  }))), /*#__PURE__*/React.createElement("details", {
-    className: "advancedControls"
-  }, /*#__PURE__*/React.createElement("summary", null, "Advanced forecast settings"), /*#__PURE__*/React.createElement("div", {
-    className: "advancedGrid"
-  }, /*#__PURE__*/React.createElement("label", null, "Life stage", /*#__PURE__*/React.createElement("select", {
-    value: filters.lifeStage,
-    onChange: function onChange(event) {
-      return updateFilter("lifeStage", event.target.value);
-    }
-  }, availableLifeStages.map(function (stage) {
-    return /*#__PURE__*/React.createElement("option", {
-      key: stage,
-      value: stage
-    }, stage === "all" ? "All stages" : stage);
-  }))), /*#__PURE__*/React.createElement("label", null, "History start", /*#__PURE__*/React.createElement("input", {
-    type: "date",
-    min: (bootstrap === null || bootstrap === void 0 ? void 0 : bootstrap.minHistoryDate) || "",
-    max: (bootstrap === null || bootstrap === void 0 ? void 0 : bootstrap.maxHistoryDate) || "",
-    value: filters.historyStart,
-    onChange: function onChange(event) {
-      return updateFilter("historyStart", event.target.value);
-    }
-  })), /*#__PURE__*/React.createElement("label", null, "History end", /*#__PURE__*/React.createElement("input", {
-    type: "date",
-    min: (bootstrap === null || bootstrap === void 0 ? void 0 : bootstrap.minHistoryDate) || "",
-    max: (bootstrap === null || bootstrap === void 0 ? void 0 : bootstrap.maxHistoryDate) || "",
-    value: filters.historyEnd,
-    onChange: function onChange(event) {
-      return updateFilter("historyEnd", event.target.value);
-    }
-  })), /*#__PURE__*/React.createElement("label", null, "Forecast scope", /*#__PURE__*/React.createElement("select", {
-    value: filters.forecastScope,
-    onChange: function onChange(event) {
-      return updateFilter("forecastScope", event.target.value);
-    }
-  }, /*#__PURE__*/React.createElement("option", {
-    value: "whole_episode"
-  }, "Whole episode"), /*#__PURE__*/React.createElement("option", {
-    value: "day1"
-  }, "Day 1 only"))), /*#__PURE__*/React.createElement("label", null, "Max similar", /*#__PURE__*/React.createElement("input", {
-    type: "number",
-    min: "10",
-    max: "300",
-    step: "10",
-    value: filters.maxSimilar,
-    onChange: function onChange(event) {
-      return updateFilter("maxSimilar", Number(event.target.value));
-    }
-  })), /*#__PURE__*/React.createElement("label", null, "Min support cases", /*#__PURE__*/React.createElement("input", {
-    type: "number",
-    min: "1",
-    max: "20",
-    step: "1",
-    value: filters.minCases,
-    onChange: function onChange(event) {
-      return updateFilter("minCases", Number(event.target.value));
-    }
-  })), /*#__PURE__*/React.createElement("label", {
-    className: "checkboxLine"
-  }, "Include procedural meds", /*#__PURE__*/React.createElement("input", {
-    type: "checkbox",
-    checked: filters.includeProcedural,
-    onChange: function onChange(event) {
-      return updateFilter("includeProcedural", event.target.checked);
-    }
-  }))))), error ? /*#__PURE__*/React.createElement("div", {
-    className: "error"
-  }, error) : null, /*#__PURE__*/React.createElement("section", {
-    className: "metrics"
-  }, /*#__PURE__*/React.createElement(Metric, {
-    label: "Similar cases",
-    value: metrics.similarAppointments,
-    detail: "sign-tag matched appointments",
-    color: "#2563eb"
-  }), /*#__PURE__*/React.createElement(Metric, {
-    label: "Inventory rows",
-    value: metrics.medications,
-    detail: "".concat(metrics.quantityNeeded || 0, " total predicted units"),
-    color: "#0f766e"
-  }), /*#__PURE__*/React.createElement(Metric, {
-    label: "Purchase by",
-    value: payload.purchaseDate || "-",
-    detail: "based on appointment date",
-    color: "#475569",
-    small: true
-  }), /*#__PURE__*/React.createElement(Metric, {
-    label: "KG evidence",
-    value: metrics.kgEvidence,
-    detail: "historical medication rows",
-    color: "#7c3aed"
-  })), /*#__PURE__*/React.createElement("section", {
-    className: "sheetTop"
-  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("h2", null, "Medication inventory sheet"), /*#__PURE__*/React.createElement("p", null, payload.clinicName, " \xB7 ", ((_payload$inventory2 = payload.inventory) === null || _payload$inventory2 === void 0 ? void 0 : _payload$inventory2.length) || 0, " medications \xB7 ", selectedVendor, " \xB7 purchase by ", payload.purchaseDate)), /*#__PURE__*/React.createElement("span", {
-    className: hasRows ? "status ready" : "status"
-  }, hasRows ? "Ready to export" : "No rows to export")), /*#__PURE__*/React.createElement("section", {
-    className: "vendorPanel"
+  }, "Forecast scope"), /*#__PURE__*/React.createElement("div", {
+    className: "targetGrid"
   }, /*#__PURE__*/React.createElement("div", {
-    className: "vendorToolbar"
-  }, /*#__PURE__*/React.createElement("label", {
-    className: "vendorSelector"
-  }, "Vendor invoice", /*#__PURE__*/React.createElement("select", {
+    className: "scopeCard"
+  }, /*#__PURE__*/React.createElement("b", null, "All upcoming appointments"), /*#__PURE__*/React.createElement("span", null, forecastCount, " forecast targets \xB7 ", metrics.kgEvidence || 0, " EVIDENCED_BY links \xB7 Neo4j only")), /*#__PURE__*/React.createElement("label", null, "Vendor invoice", /*#__PURE__*/React.createElement("select", {
     value: filters.vendor,
     onChange: function onChange(event) {
       return updateFilter("vendor", event.target.value);
@@ -594,40 +459,44 @@ function App() {
       key: vendor,
       value: vendor
     }, vendor);
-  }))), /*#__PURE__*/React.createElement("button", {
-    disabled: !hasRows || cartBusy,
-    onClick: function onClick() {
-      return createVendorCart(false, false);
-    }
-  }, "Create cart draft"), /*#__PURE__*/React.createElement("button", {
-    disabled: !hasRows || cartBusy,
-    onClick: function onClick() {
-      return createVendorCart(true, true);
-    }
-  }, "Open website and add cart")), /*#__PURE__*/React.createElement("div", {
-    className: "vendorSummary"
-  }, /*#__PURE__*/React.createElement("b", null, selectedVendor, " invoice"), /*#__PURE__*/React.createElement("span", null, Math.min(3, vendorInvoice.length || 0), " rows \xB7 ", payload.vendorWebsite || "KG supplier", " \xB7 ", payload.vendorCartMode || "vendor draft")), /*#__PURE__*/React.createElement(VendorInvoiceTable, {
-    rows: previewRows
-  }), cartResult ? /*#__PURE__*/React.createElement("div", {
-    className: "cartResult ".concat(cartResult.status || "")
-  }, /*#__PURE__*/React.createElement("b", null, cartStatusLabel), /*#__PURE__*/React.createElement("span", null, cartResult.message), (_cartResult$results = cartResult.results) !== null && _cartResult$results !== void 0 && _cartResult$results.length ? /*#__PURE__*/React.createElement("div", {
-    className: "cartResultList"
-  }, /*#__PURE__*/React.createElement("span", null, "Added: ", cartResult.results.filter(function (row) {
-    return String(row.status || "").startsWith("added_to_cart");
-  }).map(function (row) {
-    return row["Medication Name"];
-  }).join(", ") || "No items confirmed")) : null) : null), /*#__PURE__*/React.createElement("section", {
+  })))), /*#__PURE__*/React.createElement("div", {
+    className: "appointmentSummary"
+  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("b", null, "Clinic"), /*#__PURE__*/React.createElement("span", null, payload.clinicName || "Florida Plantation Clinic")), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("b", null, "Period"), /*#__PURE__*/React.createElement("span", null, forecastPeriod || "-")), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("b", null, "Demand"), /*#__PURE__*/React.createElement("span", null, metrics.quantityNeeded || 0, " units")), /*#__PURE__*/React.createElement("div", {
+    className: "summaryWide"
+  }, /*#__PURE__*/React.createElement("b", null, "Source"), /*#__PURE__*/React.createElement("span", null, "Future appointments matched to historical invoice items in Neo4j")))), error ? /*#__PURE__*/React.createElement("div", {
+    className: "error"
+  }, error) : null, /*#__PURE__*/React.createElement("section", {
+    className: "metrics"
+  }, /*#__PURE__*/React.createElement(Metric, {
+    label: "Upcoming appointments",
+    value: forecastCount,
+    detail: "".concat(metrics.kgEvidence || 0, " KG evidence links"),
+    color: "#2563eb"
+  }), /*#__PURE__*/React.createElement(Metric, {
+    label: "Inventory rows",
+    value: metrics.medications,
+    detail: "".concat(metrics.quantityNeeded || 0, " units to prepare"),
+    color: "#0f766e"
+  }), /*#__PURE__*/React.createElement(Metric, {
+    label: "Expected billing",
+    value: money(metrics.expectedTotalCost),
+    detail: "forecasted across schedule",
+    color: "#475569",
+    small: true
+  })), /*#__PURE__*/React.createElement("section", {
+    className: "sheetTop"
+  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("h2", null, "Medication inventory sheet"), /*#__PURE__*/React.createElement("p", null, payload.clinicName, " \xB7 all upcoming appointments \xB7 ", selectedVendor, " \xB7 purchase by ", payload.purchaseDate)), /*#__PURE__*/React.createElement("span", {
+    className: hasRows ? "status ready" : "status"
+  }, hasRows ? "Ready to export" : "No rows to export")), /*#__PURE__*/React.createElement("section", {
     className: "sheet"
   }, /*#__PURE__*/React.createElement("div", {
     className: "sheetHeader"
-  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("h3", null, "Medication Inventory Tracker"), /*#__PURE__*/React.createElement("p", null, "Presenting complaint: ", payload.appointmentReason || filters.appointmentReason)), /*#__PURE__*/React.createElement("strong", null, "Purchase by ", payload.purchaseDate)), /*#__PURE__*/React.createElement("div", {
+  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("h3", null, "Medication Inventory Tracker"), /*#__PURE__*/React.createElement("p", null, "All upcoming appointments \xB7 ", forecastPeriod)), /*#__PURE__*/React.createElement("strong", null, "Purchase by ", payload.purchaseDate)), /*#__PURE__*/React.createElement("div", {
     className: "metaRows"
-  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("b", null, "Clinic"), /*#__PURE__*/React.createElement("span", null, payload.clinicName)), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("b", null, "Appointment Date"), /*#__PURE__*/React.createElement("span", null, payload.appointmentDate)), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("b", null, "Cohort"), /*#__PURE__*/React.createElement("span", null, payload.species || filters.species, " \xB7 ", payload.lifeStage || filters.lifeStage)), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("b", null, "Scope"), /*#__PURE__*/React.createElement("span", null, payload.forecastScope === "day1" ? "Day 1 only" : "Whole episode")), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("b", null, "Vendor"), /*#__PURE__*/React.createElement("span", null, selectedVendor))), /*#__PURE__*/React.createElement(InventoryTable, {
+  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("b", null, "Clinic"), /*#__PURE__*/React.createElement("span", null, payload.clinicName)), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("b", null, "Forecast Period"), /*#__PURE__*/React.createElement("span", null, forecastPeriod)), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("b", null, "Forecast Source"), /*#__PURE__*/React.createElement("span", null, forecastCount, " upcoming appointments")), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("b", null, "Vendor"), /*#__PURE__*/React.createElement("span", null, selectedVendor))), /*#__PURE__*/React.createElement(InventoryTable, {
     rows: payload.inventory || [],
     loading: loading
-  }), /*#__PURE__*/React.createElement("div", {
-    className: "notes"
-  }, /*#__PURE__*/React.createElement("b", null, "Notes"), /*#__PURE__*/React.createElement("span", null, "Medications come from sign-tag matched historical cases. Supplier follows the selected vendor; prices stay marked as quote needed until vendor pricing is loaded."))), /*#__PURE__*/React.createElement("section", {
+  })), /*#__PURE__*/React.createElement("section", {
     className: "exportBar"
   }, /*#__PURE__*/React.createElement("div", {
     className: "exportTitle"
@@ -648,31 +517,37 @@ function App() {
     onClick: function onClick() {
       return exportSheet("csv");
     }
-  }, "CSV"), /*#__PURE__*/React.createElement("span", null, "Exports use the selected vendor and the rows shown above for the ", payload.appointmentDate, " appointment."))), /*#__PURE__*/React.createElement("section", {
+  }, "CSV"), /*#__PURE__*/React.createElement("span", null, "Exports use all upcoming appointment forecast rows and the selected vendor."))), /*#__PURE__*/React.createElement("section", {
     className: "evidence"
-  }, /*#__PURE__*/React.createElement("details", null, /*#__PURE__*/React.createElement("summary", null, "Forecast method"), /*#__PURE__*/React.createElement("div", {
-    className: "methodGrid"
-  }, (payload.forecastRules || []).map(function (rule) {
-    return /*#__PURE__*/React.createElement("span", {
-      className: "ruleChip",
-      key: rule
-    }, rule);
-  }), /*#__PURE__*/React.createElement("span", {
-    className: "ruleChip"
-  }, filters.forecastScope === "day1" ? "Day-1 medication demand" : "Whole-episode medication demand"))), /*#__PURE__*/React.createElement("details", {
-    open: true
-  }, /*#__PURE__*/React.createElement("summary", null, "Why these medications are on the sheet"), /*#__PURE__*/React.createElement(EvidenceTable, {
-    title: "Forecast support by medication",
-    rows: payload.provenance || []
-  })), /*#__PURE__*/React.createElement("details", null, /*#__PURE__*/React.createElement("summary", null, "Matched appointments and medication paths"), /*#__PURE__*/React.createElement("div", {
-    className: "evidenceGrid"
-  }, /*#__PURE__*/React.createElement(EvidenceTable, {
-    title: "Sign-tag matched appointments",
-    rows: payload.similarAppointments || []
-  }), /*#__PURE__*/React.createElement(EvidenceTable, {
-    title: "Historical medication path rows",
-    rows: payload.medicationEvidence || []
-  })))), /*#__PURE__*/React.createElement(ChatWidget, {
+  }, /*#__PURE__*/React.createElement(EvidenceCards, {
+    rows: payload.evidenceTrail || []
+  })), /*#__PURE__*/React.createElement("section", {
+    className: "vendorPanel"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "vendorToolbar"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "vendorSelector"
+  }, /*#__PURE__*/React.createElement("b", null, selectedVendor, " invoice"), /*#__PURE__*/React.createElement("span", null, "Showing ", Math.min(3, vendorInvoice.length || 0), " of ", vendorInvoice.length || 0, " rows \xB7 ", payload.vendorWebsite || "KG supplier")), /*#__PURE__*/React.createElement("button", {
+    disabled: !hasRows || cartBusy,
+    onClick: function onClick() {
+      return createVendorCart(false, false);
+    }
+  }, "Create cart draft"), /*#__PURE__*/React.createElement("button", {
+    disabled: !hasRows || cartBusy,
+    onClick: function onClick() {
+      return createVendorCart(true, true);
+    }
+  }, "Open website and add cart")), /*#__PURE__*/React.createElement(VendorInvoiceTable, {
+    rows: vendorPreview
+  }), cartResult ? /*#__PURE__*/React.createElement("div", {
+    className: "cartResult ".concat(cartResult.status || "")
+  }, /*#__PURE__*/React.createElement("b", null, cartStatusLabel), /*#__PURE__*/React.createElement("span", null, cartResult.message), (_cartResult$results = cartResult.results) !== null && _cartResult$results !== void 0 && _cartResult$results.length ? /*#__PURE__*/React.createElement("div", {
+    className: "cartResultList"
+  }, /*#__PURE__*/React.createElement("span", null, "Confirmed: ", cartResult.results.filter(function (row) {
+    return String(row.status || "").startsWith("added_to_cart");
+  }).map(function (row) {
+    return row["Medication Name"];
+  }).join(", ") || "No additions confirmed yet")) : null) : null), /*#__PURE__*/React.createElement(ChatWidget, {
     open: chatOpen,
     setOpen: setChatOpen,
     messages: messages,
@@ -704,20 +579,18 @@ function Metric(_ref) {
 }
 function InventoryTable(_ref2) {
   var rows = _ref2.rows,
-    _ref2$compact = _ref2.compact,
-    compact = _ref2$compact === void 0 ? false : _ref2$compact,
     _ref2$loading = _ref2.loading,
     loading = _ref2$loading === void 0 ? false : _ref2$loading;
-  var headers = ["Medication Name", "Product Type", "Quantity Needed", "Unit Size", "Minimum Quantity", "Date To Purchase", "Supplier or Store", "Price Paid"];
+  var headers = ["Medication Name", "Product Type", "Quantity Needed", "Expected Units", "Unit Size", "Forecasted Appointments", "Date To Purchase", "Supplier or Store", "Expected Cost"];
   return /*#__PURE__*/React.createElement("div", {
-    className: compact ? "tableWrap compact" : "tableWrap"
+    className: "tableWrap"
   }, /*#__PURE__*/React.createElement("table", null, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, headers.map(function (header) {
     return /*#__PURE__*/React.createElement("th", {
       key: header
     }, header);
   }))), /*#__PURE__*/React.createElement("tbody", null, loading ? /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("td", {
     colSpan: headers.length
-  }, "Building inventory sheet from the knowledge graph...")) : rows.length ? rows.map(function (row, index) {
+  }, "Building inventory sheet from forecasted invoice lines...")) : rows.length ? rows.map(function (row, index) {
     return /*#__PURE__*/React.createElement("tr", {
       key: "".concat(row["Medication Name"], "-").concat(index)
     }, headers.map(function (header) {
@@ -727,7 +600,7 @@ function InventoryTable(_ref2) {
     }));
   }) : /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("td", {
     colSpan: headers.length
-  }, "No medication inventory rows were predicted for this appointment.")))));
+  }, "No stockable medication rows were predicted for upcoming appointments.")))));
 }
 function VendorInvoiceTable(_ref3) {
   var rows = _ref3.rows;
@@ -750,10 +623,37 @@ function VendorInvoiceTable(_ref3) {
     colSpan: headers.length
   }, "No vendor invoice rows are available yet.")))));
 }
-function EvidenceTable(_ref4) {
-  var title = _ref4.title,
-    rows = _ref4.rows;
-  var headers = rows[0] ? Object.keys(rows[0]) : [];
+function EvidenceCards(_ref4) {
+  var rows = _ref4.rows;
+  var cards = (rows || []).slice(0, 3);
+  if (!cards.length) {
+    return /*#__PURE__*/React.createElement("section", {
+      className: "evidenceCards"
+    }, /*#__PURE__*/React.createElement("div", {
+      className: "evidenceCard"
+    }, /*#__PURE__*/React.createElement("b", null, "KG evidence"), /*#__PURE__*/React.createElement("p", null, "No evidence rows are available from Neo4j.")));
+  }
+  return /*#__PURE__*/React.createElement("section", {
+    className: "evidenceCards"
+  }, cards.map(function (row, index) {
+    return /*#__PURE__*/React.createElement("article", {
+      className: "evidenceCard",
+      key: "".concat(row["Future Appointment"], "-").concat(row["Past Appointment"], "-").concat(index)
+    }, /*#__PURE__*/React.createElement("div", {
+      className: "evidenceCardTop"
+    }, /*#__PURE__*/React.createElement("b", null, row["Future Pet"] || row["Future Appointment"]), /*#__PURE__*/React.createElement("span", null, row["Future Date"], " \xB7 similarity ", row.Similarity)), /*#__PURE__*/React.createElement("div", {
+      className: "evidencePair"
+    }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("small", null, "Future complaint"), /*#__PURE__*/React.createElement("p", null, row["Future Complaint"] || "-")), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("small", null, "Matched invoice visit"), /*#__PURE__*/React.createElement("p", null, row["Past Appointment"], " \xB7 ", row["Past Date"]))), /*#__PURE__*/React.createElement("div", {
+      className: "invoiceSnippet"
+    }, /*#__PURE__*/React.createElement("small", null, "Invoice evidence"), /*#__PURE__*/React.createElement("p", null, row["Invoice Items"] || "-")));
+  }));
+}
+function EvidenceTable(_ref5) {
+  var title = _ref5.title,
+    rows = _ref5.rows;
+  var headers = rows[0] ? Object.keys(rows[0]).filter(function (header) {
+    return !header.startsWith("_");
+  }) : [];
   return /*#__PURE__*/React.createElement("div", {
     className: "evidencePanel"
   }, /*#__PURE__*/React.createElement("h4", null, title), /*#__PURE__*/React.createElement("div", {
@@ -773,14 +673,14 @@ function EvidenceTable(_ref4) {
     }));
   }) : /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("td", null, "No evidence rows."))))));
 }
-function ChatWidget(_ref5) {
-  var open = _ref5.open,
-    setOpen = _ref5.setOpen,
-    messages = _ref5.messages,
-    chatInput = _ref5.chatInput,
-    setChatInput = _ref5.setChatInput,
-    sendMessage = _ref5.sendMessage,
-    busy = _ref5.busy;
+function ChatWidget(_ref6) {
+  var open = _ref6.open,
+    setOpen = _ref6.setOpen,
+    messages = _ref6.messages,
+    chatInput = _ref6.chatInput,
+    setChatInput = _ref6.setChatInput,
+    sendMessage = _ref6.sendMessage,
+    busy = _ref6.busy;
   function sourceLabel(source) {
     if (source === "kg-fast-cache") return "KG cache";
     if (source === "kg-fast") return "KG";
@@ -791,7 +691,7 @@ function ChatWidget(_ref5) {
     className: "chatPanel"
   }, /*#__PURE__*/React.createElement("div", {
     className: "chatHeader"
-  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("strong", null, "Inventory assistant"), /*#__PURE__*/React.createElement("span", null, "Fast KG answers, Codex for deeper analysis")), /*#__PURE__*/React.createElement("button", {
+  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("strong", null, "Inventory assistant"), /*#__PURE__*/React.createElement("span", null, "Ask why, quantity, vendor, or evidence questions")), /*#__PURE__*/React.createElement("button", {
     onClick: function onClick() {
       return setOpen(false);
     },
@@ -805,7 +705,7 @@ function ChatWidget(_ref5) {
     }, /*#__PURE__*/React.createElement("b", null, message.role === "user" ? "You" : "Assistant"), /*#__PURE__*/React.createElement("p", null, message.content), message.source ? /*#__PURE__*/React.createElement("small", null, sourceLabel(message.source)) : null);
   }), busy ? /*#__PURE__*/React.createElement("div", {
     className: "message assistant"
-  }, /*#__PURE__*/React.createElement("b", null, "Assistant"), /*#__PURE__*/React.createElement("p", null, "Checking the KG inventory...")) : null), /*#__PURE__*/React.createElement("form", {
+  }, /*#__PURE__*/React.createElement("b", null, "Assistant"), /*#__PURE__*/React.createElement("p", null, "Checking forecast evidence...")) : null), /*#__PURE__*/React.createElement("form", {
     className: "chatForm",
     onSubmit: sendMessage
   }, /*#__PURE__*/React.createElement("input", {
@@ -813,7 +713,7 @@ function ChatWidget(_ref5) {
     onChange: function onChange(event) {
       return setChatInput(event.target.value);
     },
-    placeholder: "Quantity needed? Supplier or price? Why included?"
+    placeholder: "Why is Gabapentin here?"
   }), /*#__PURE__*/React.createElement("button", {
     disabled: busy || !chatInput.trim()
   }, "Ask"))) : null, /*#__PURE__*/React.createElement("button", {

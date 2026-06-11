@@ -5,9 +5,10 @@ const emptyMetrics = {
   medications: 0,
   quantityNeeded: 0,
   kgEvidence: 0,
-  noiseFloor: 3,
-  graphNodes: 0,
-  graphRelationships: 0,
+  chargeLines: 0,
+  expectedTotalCost: 0,
+  forecastVisits: 0,
+  fourWeekStockItems: 0,
   database: "neo4j",
 };
 
@@ -17,6 +18,12 @@ function todayPlus(days) {
   const value = new Date();
   value.setDate(value.getDate() + days);
   return value.toISOString().slice(0, 10);
+}
+
+function money(value) {
+  const number = Number(value || 0);
+  if (!Number.isFinite(number)) return "$0.00";
+  return number.toLocaleString("en-US", { style: "currency", currency: "USD" });
 }
 
 function downloadBlob(blob, filename) {
@@ -30,36 +37,30 @@ function downloadBlob(blob, filename) {
   URL.revokeObjectURL(url);
 }
 
-function fileStem(filters) {
-  const vendor = (filters.vendor || "Amazon").toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
-  return `florida_plantation_medication_inventory_${vendor || "vendor"}_${filters.appointmentDate || todayPlus(7)}`;
+function fileStem(filters, payload) {
+  const vendor = (filters.vendor || "vendor").toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
+  const period = (payload.appointmentDate || "all_future").replace(/[^a-z0-9]+/gi, "_").replace(/^_|_$/g, "");
+  return `florida_plantation_inventory_${vendor}_${period}`;
 }
 
 function App() {
   const [bootstrap, setBootstrap] = useState(null);
   const [filters, setFilters] = useState({
-    appointmentReason: "vomiting",
-    appointmentDate: todayPlus(7),
-    historyStart: "",
-    historyEnd: "",
-    maxSimilar: 80,
-    species: "all",
-    lifeStage: "all",
-    forecastScope: "whole_episode",
-    includeProcedural: false,
-    minCases: 3,
-    vendor: "Amazon",
+    vendor: "Med-Vet International",
   });
   const [payload, setPayload] = useState({
     clinicName: "Florida Plantation Clinic",
+    forecastOptions: [],
     inventory: [],
-    similarAppointments: [],
-    medicationEvidence: [],
+    vendorInvoice: [],
+    chargeLines: [],
+    inventoryRollup: [],
+    evidenceTrail: [],
     provenance: [],
     forecastRules: [],
     metrics: emptyMetrics,
     purchaseDate: todayPlus(5),
-    vendor: "Amazon",
+    vendor: "Med-Vet International",
     vendorOptions: defaultVendors,
   });
   const [loading, setLoading] = useState(true);
@@ -72,27 +73,35 @@ function App() {
   const [messages, setMessages] = useState([
     {
       role: "assistant",
-      content: "Ask about medication quantities, suppliers, price gaps, or why a medication is on the sheet.",
+      content: "Ask why a medication is on the sheet, which past visits support it, or what needs to be ordered.",
     },
   ]);
 
   const requestFilters = useMemo(() => filters, [filters]);
-  const availableLifeStages = bootstrap?.lifeStages?.[filters.species] || bootstrap?.lifeStages?.all || ["all"];
+  const metrics = payload.metrics || emptyMetrics;
+  const vendorOptions = payload.vendorOptions || bootstrap?.vendorOptions || defaultVendors;
+  const hasRows = payload.inventory?.length > 0;
+  const selectedVendor = payload.vendor || filters.vendor || "Med-Vet International";
+  const vendorInvoice = payload.vendorInvoice || [];
+  const vendorPreview = vendorInvoice.slice(0, 3);
+  const forecastCount = metrics.forecastVisits || bootstrap?.forecastOptions?.length || 0;
+  const forecastPeriod = payload.appointmentDate || `${bootstrap?.minHistoryDate || ""} to ${bootstrap?.maxHistoryDate || ""}`;
+  const cartStatusLabel = {
+    cart_complete: "Cart complete",
+    cart_partial: "Cart partially complete",
+    cart_stopped: "Cart stopped",
+    draft_ready: "Cart draft ready",
+    manual_review: "Manual review",
+  }[cartResult?.status] || "Cart update";
 
   async function loadBootstrap() {
     const response = await fetch("/api/bootstrap");
-    if (!response.ok) throw new Error("Could not load graph metadata.");
+    if (!response.ok) throw new Error("Could not load forecast metadata.");
     const data = await response.json();
     setBootstrap(data);
     setFilters((current) => ({
       ...current,
-      appointmentReason: data.suggestions?.[0] || current.appointmentReason,
-      appointmentDate: data.defaultAppointmentDate || current.appointmentDate,
-      historyStart: data.defaultHistoryStart || current.historyStart,
-      historyEnd: data.maxHistoryDate || current.historyEnd,
-      species: current.species || "all",
-      lifeStage: current.lifeStage || "all",
-      vendor: current.vendor || "Amazon",
+      vendor: current.vendor || "Med-Vet International",
     }));
   }
 
@@ -105,7 +114,7 @@ function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(nextFilters),
       });
-      if (!response.ok) throw new Error("Could not build inventory sheet.");
+      if (!response.ok) throw new Error("Could not build the forecast charge sheet.");
       const data = await response.json();
       setPayload(data);
     } catch (err) {
@@ -123,30 +132,12 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (filters.historyStart && filters.historyEnd) {
-      loadInventory(filters);
-    }
-  }, [
-    filters.appointmentReason,
-    filters.appointmentDate,
-    filters.historyStart,
-    filters.historyEnd,
-    filters.maxSimilar,
-    filters.species,
-    filters.lifeStage,
-    filters.forecastScope,
-    filters.includeProcedural,
-    filters.minCases,
-    filters.vendor,
-  ]);
+    loadInventory(filters);
+  }, [filters.vendor]);
 
   function updateFilter(name, value) {
     if (name === "vendor") setCartResult(null);
-    setFilters((current) => {
-      const next = { ...current, [name]: value };
-      if (name === "species") next.lifeStage = "all";
-      return next;
-    });
+    setFilters((current) => ({ ...current, [name]: value }));
   }
 
   async function exportSheet(type) {
@@ -160,7 +151,7 @@ function App() {
       return;
     }
     const blob = await response.blob();
-    downloadBlob(blob, `${fileStem(filters)}.${type === "xlsx" ? "xlsx" : type}`);
+    downloadBlob(blob, `${fileStem(filters, payload)}.${type === "xlsx" ? "xlsx" : type}`);
   }
 
   async function sendMessage(event) {
@@ -220,28 +211,14 @@ function App() {
     }
   }
 
-  const metrics = payload.metrics || emptyMetrics;
-  const hasRows = payload.inventory?.length > 0;
-  const vendorOptions = payload.vendorOptions || bootstrap?.vendorOptions || defaultVendors;
-  const selectedVendor = payload.vendor || filters.vendor || "Amazon";
-  const vendorInvoice = payload.vendorInvoice || [];
-  const previewRows = vendorInvoice.slice(0, 3);
-  const cartStatusLabel = {
-    cart_complete: "Cart complete",
-    cart_partial: "Cart partially complete",
-    cart_stopped: "Cart stopped",
-    draft_ready: "Cart draft ready",
-  }[cartResult?.status] || "Cart update";
-
   return (
     <main>
       <section className="hero">
         <div>
           <div className="eyebrow">{payload.clinicName || "Florida Plantation Clinic"}</div>
-          <h1>Medication Inventory Tracker</h1>
+          <h1>Forecast Charge Sheet</h1>
           <p>
-            Forecast medication inventory from future appointment complaints using the knowledge graph's clinical
-            sign chain, cohort filters, and traceable historical medication paths.
+            Clinic-level medication inventory from all upcoming appointments, similar historical invoices, and a KG-backed why trail.
           </p>
         </div>
         <div className="heroBadge">
@@ -251,134 +228,13 @@ function App() {
       </section>
 
       <section className="controls">
-        <div className="controlHeading">Forecast setup</div>
-        <div className="primaryControlGrid">
-          <label className="wide">
-            Presenting complaint
-            <input
-              list="complaintSuggestions"
-              value={filters.appointmentReason}
-              onChange={(event) => updateFilter("appointmentReason", event.target.value)}
-              placeholder="Example: vomiting, pruritus, dental calculus, wellness exam"
-            />
-            <datalist id="complaintSuggestions">
-              {(bootstrap?.suggestions || ["vomiting"]).map((suggestion) => (
-                <option key={suggestion} value={suggestion} />
-              ))}
-            </datalist>
-          </label>
-          <label>
-            Species
-            <select value={filters.species} onChange={(event) => updateFilter("species", event.target.value)}>
-              {(bootstrap?.species || ["all", "canine", "feline"]).map((species) => (
-                <option key={species} value={species}>{species === "all" ? "All species" : species}</option>
-              ))}
-            </select>
-          </label>
-          <label>
-            Future appointment date
-            <input
-              type="date"
-              min={new Date().toISOString().slice(0, 10)}
-              value={filters.appointmentDate}
-              onChange={(event) => updateFilter("appointmentDate", event.target.value)}
-            />
-          </label>
-        </div>
-        <details className="advancedControls">
-          <summary>Advanced forecast settings</summary>
-          <div className="advancedGrid">
-            <label>
-              Life stage
-              <select value={filters.lifeStage} onChange={(event) => updateFilter("lifeStage", event.target.value)}>
-                {availableLifeStages.map((stage) => (
-                  <option key={stage} value={stage}>{stage === "all" ? "All stages" : stage}</option>
-                ))}
-              </select>
-            </label>
-            <label>
-              History start
-              <input
-                type="date"
-                min={bootstrap?.minHistoryDate || ""}
-                max={bootstrap?.maxHistoryDate || ""}
-                value={filters.historyStart}
-                onChange={(event) => updateFilter("historyStart", event.target.value)}
-              />
-            </label>
-            <label>
-              History end
-              <input
-                type="date"
-                min={bootstrap?.minHistoryDate || ""}
-                max={bootstrap?.maxHistoryDate || ""}
-                value={filters.historyEnd}
-                onChange={(event) => updateFilter("historyEnd", event.target.value)}
-              />
-            </label>
-            <label>
-              Forecast scope
-              <select value={filters.forecastScope} onChange={(event) => updateFilter("forecastScope", event.target.value)}>
-                <option value="whole_episode">Whole episode</option>
-                <option value="day1">Day 1 only</option>
-              </select>
-            </label>
-            <label>
-              Max similar
-              <input
-                type="number"
-                min="10"
-                max="300"
-                step="10"
-                value={filters.maxSimilar}
-                onChange={(event) => updateFilter("maxSimilar", Number(event.target.value))}
-              />
-            </label>
-            <label>
-              Min support cases
-              <input
-                type="number"
-                min="1"
-                max="20"
-                step="1"
-                value={filters.minCases}
-                onChange={(event) => updateFilter("minCases", Number(event.target.value))}
-              />
-            </label>
-            <label className="checkboxLine">
-              Include procedural meds
-              <input
-                type="checkbox"
-                checked={filters.includeProcedural}
-                onChange={(event) => updateFilter("includeProcedural", event.target.checked)}
-              />
-            </label>
+        <div className="controlHeading">Forecast scope</div>
+        <div className="targetGrid">
+          <div className="scopeCard">
+            <b>All upcoming appointments</b>
+            <span>{forecastCount} forecast targets · {metrics.kgEvidence || 0} EVIDENCED_BY links · Neo4j only</span>
           </div>
-        </details>
-      </section>
-
-      {error ? <div className="error">{error}</div> : null}
-
-      <section className="metrics">
-        <Metric label="Similar cases" value={metrics.similarAppointments} detail="sign-tag matched appointments" color="#2563eb" />
-        <Metric label="Inventory rows" value={metrics.medications} detail={`${metrics.quantityNeeded || 0} total predicted units`} color="#0f766e" />
-        <Metric label="Purchase by" value={payload.purchaseDate || "-"} detail="based on appointment date" color="#475569" small />
-        <Metric label="KG evidence" value={metrics.kgEvidence} detail="historical medication rows" color="#7c3aed" />
-      </section>
-
-      <section className="sheetTop">
-        <div>
-          <h2>Medication inventory sheet</h2>
-          <p>
-            {payload.clinicName} · {payload.inventory?.length || 0} medications · {selectedVendor} · purchase by {payload.purchaseDate}
-          </p>
-        </div>
-        <span className={hasRows ? "status ready" : "status"}>{hasRows ? "Ready to export" : "No rows to export"}</span>
-      </section>
-
-      <section className="vendorPanel">
-        <div className="vendorToolbar">
-          <label className="vendorSelector">
+          <label>
             Vendor invoice
             <select value={filters.vendor} onChange={(event) => updateFilter("vendor", event.target.value)}>
               {vendorOptions.map((vendor) => (
@@ -386,57 +242,48 @@ function App() {
               ))}
             </select>
           </label>
-          <button disabled={!hasRows || cartBusy} onClick={() => createVendorCart(false, false)}>Create cart draft</button>
-          <button disabled={!hasRows || cartBusy} onClick={() => createVendorCart(true, true)}>Open website and add cart</button>
         </div>
-        <div className="vendorSummary">
-          <b>{selectedVendor} invoice</b>
-          <span>
-            {Math.min(3, vendorInvoice.length || 0)} rows · {payload.vendorWebsite || "KG supplier"} · {payload.vendorCartMode || "vendor draft"}
-          </span>
+        <div className="appointmentSummary">
+          <div><b>Clinic</b><span>{payload.clinicName || "Florida Plantation Clinic"}</span></div>
+          <div><b>Period</b><span>{forecastPeriod || "-"}</span></div>
+          <div><b>Demand</b><span>{metrics.quantityNeeded || 0} units</span></div>
+          <div className="summaryWide"><b>Source</b><span>Future appointments matched to historical invoice items in Neo4j</span></div>
         </div>
-        <VendorInvoiceTable rows={previewRows} />
-        {cartResult ? (
-          <div className={`cartResult ${cartResult.status || ""}`}>
-            <b>{cartStatusLabel}</b>
-            <span>{cartResult.message}</span>
-            {cartResult.results?.length ? (
-              <div className="cartResultList">
-                <span>
-                  Added: {cartResult.results
-                    .filter((row) => String(row.status || "").startsWith("added_to_cart"))
-                    .map((row) => row["Medication Name"])
-                    .join(", ") || "No items confirmed"}
-                </span>
-              </div>
-            ) : null}
-          </div>
-        ) : null}
+      </section>
+
+      {error ? <div className="error">{error}</div> : null}
+
+      <section className="metrics">
+        <Metric label="Upcoming appointments" value={forecastCount} detail={`${metrics.kgEvidence || 0} KG evidence links`} color="#2563eb" />
+        <Metric label="Inventory rows" value={metrics.medications} detail={`${metrics.quantityNeeded || 0} units to prepare`} color="#0f766e" />
+        <Metric label="Expected billing" value={money(metrics.expectedTotalCost)} detail="forecasted across schedule" color="#475569" small />
+      </section>
+
+      <section className="sheetTop">
+        <div>
+          <h2>Medication inventory sheet</h2>
+          <p>
+            {payload.clinicName} · all upcoming appointments · {selectedVendor} · purchase by {payload.purchaseDate}
+          </p>
+        </div>
+        <span className={hasRows ? "status ready" : "status"}>{hasRows ? "Ready to export" : "No rows to export"}</span>
       </section>
 
       <section className="sheet">
         <div className="sheetHeader">
           <div>
             <h3>Medication Inventory Tracker</h3>
-            <p>Presenting complaint: {payload.appointmentReason || filters.appointmentReason}</p>
+            <p>All upcoming appointments · {forecastPeriod}</p>
           </div>
           <strong>Purchase by {payload.purchaseDate}</strong>
         </div>
         <div className="metaRows">
           <div><b>Clinic</b><span>{payload.clinicName}</span></div>
-          <div><b>Appointment Date</b><span>{payload.appointmentDate}</span></div>
-          <div><b>Cohort</b><span>{payload.species || filters.species} · {payload.lifeStage || filters.lifeStage}</span></div>
-          <div><b>Scope</b><span>{payload.forecastScope === "day1" ? "Day 1 only" : "Whole episode"}</span></div>
+          <div><b>Forecast Period</b><span>{forecastPeriod}</span></div>
+          <div><b>Forecast Source</b><span>{forecastCount} upcoming appointments</span></div>
           <div><b>Vendor</b><span>{selectedVendor}</span></div>
         </div>
         <InventoryTable rows={payload.inventory || []} loading={loading} />
-        <div className="notes">
-          <b>Notes</b>
-          <span>
-            Medications come from sign-tag matched historical cases. Supplier follows the selected vendor; prices stay
-            marked as quote needed until vendor pricing is loaded.
-          </span>
-        </div>
       </section>
 
       <section className="exportBar">
@@ -445,33 +292,42 @@ function App() {
           <button disabled={!hasRows} onClick={() => exportSheet("pdf")}>PDF</button>
           <button disabled={!hasRows} onClick={() => exportSheet("xlsx")}>Excel</button>
           <button disabled={!hasRows} onClick={() => exportSheet("csv")}>CSV</button>
-          <span>Exports use the selected vendor and the rows shown above for the {payload.appointmentDate} appointment.</span>
+          <span>Exports use all upcoming appointment forecast rows and the selected vendor.</span>
         </div>
       </section>
 
       <section className="evidence">
-        <details>
-          <summary>Forecast method</summary>
-          <div className="methodGrid">
-            {(payload.forecastRules || []).map((rule) => (
-              <span className="ruleChip" key={rule}>{rule}</span>
-            ))}
-            <span className="ruleChip">
-              {filters.forecastScope === "day1" ? "Day-1 medication demand" : "Whole-episode medication demand"}
+        <EvidenceCards rows={payload.evidenceTrail || []} />
+      </section>
+
+      <section className="vendorPanel">
+        <div className="vendorToolbar">
+          <div className="vendorSelector">
+            <b>{selectedVendor} invoice</b>
+            <span>
+              Showing {Math.min(3, vendorInvoice.length || 0)} of {vendorInvoice.length || 0} rows · {payload.vendorWebsite || "KG supplier"}
             </span>
           </div>
-        </details>
-        <details open>
-          <summary>Why these medications are on the sheet</summary>
-          <EvidenceTable title="Forecast support by medication" rows={payload.provenance || []} />
-        </details>
-        <details>
-          <summary>Matched appointments and medication paths</summary>
-          <div className="evidenceGrid">
-            <EvidenceTable title="Sign-tag matched appointments" rows={payload.similarAppointments || []} />
-            <EvidenceTable title="Historical medication path rows" rows={payload.medicationEvidence || []} />
+          <button disabled={!hasRows || cartBusy} onClick={() => createVendorCart(false, false)}>Create cart draft</button>
+          <button disabled={!hasRows || cartBusy} onClick={() => createVendorCart(true, true)}>Open website and add cart</button>
+        </div>
+        <VendorInvoiceTable rows={vendorPreview} />
+        {cartResult ? (
+          <div className={`cartResult ${cartResult.status || ""}`}>
+            <b>{cartStatusLabel}</b>
+            <span>{cartResult.message}</span>
+            {cartResult.results?.length ? (
+              <div className="cartResultList">
+                <span>
+                  Confirmed: {cartResult.results
+                    .filter((row) => String(row.status || "").startsWith("added_to_cart"))
+                    .map((row) => row["Medication Name"])
+                    .join(", ") || "No additions confirmed yet"}
+                </span>
+              </div>
+            ) : null}
           </div>
-        </details>
+        ) : null}
       </section>
 
       <ChatWidget
@@ -497,26 +353,27 @@ function Metric({ label, value, detail, color, small = false }) {
   );
 }
 
-function InventoryTable({ rows, compact = false, loading = false }) {
+function InventoryTable({ rows, loading = false }) {
   const headers = [
     "Medication Name",
     "Product Type",
     "Quantity Needed",
+    "Expected Units",
     "Unit Size",
-    "Minimum Quantity",
+    "Forecasted Appointments",
     "Date To Purchase",
     "Supplier or Store",
-    "Price Paid",
+    "Expected Cost",
   ];
   return (
-    <div className={compact ? "tableWrap compact" : "tableWrap"}>
+    <div className="tableWrap">
       <table>
         <thead>
           <tr>{headers.map((header) => <th key={header}>{header}</th>)}</tr>
         </thead>
         <tbody>
           {loading ? (
-            <tr><td colSpan={headers.length}>Building inventory sheet from the knowledge graph...</td></tr>
+            <tr><td colSpan={headers.length}>Building inventory sheet from forecasted invoice lines...</td></tr>
           ) : rows.length ? (
             rows.map((row, index) => (
               <tr key={`${row["Medication Name"]}-${index}`}>
@@ -524,7 +381,7 @@ function InventoryTable({ rows, compact = false, loading = false }) {
               </tr>
             ))
           ) : (
-            <tr><td colSpan={headers.length}>No medication inventory rows were predicted for this appointment.</td></tr>
+            <tr><td colSpan={headers.length}>No stockable medication rows were predicted for upcoming appointments.</td></tr>
           )}
         </tbody>
       </table>
@@ -556,8 +413,48 @@ function VendorInvoiceTable({ rows }) {
   );
 }
 
+function EvidenceCards({ rows }) {
+  const cards = (rows || []).slice(0, 3);
+  if (!cards.length) {
+    return (
+      <section className="evidenceCards">
+        <div className="evidenceCard">
+          <b>KG evidence</b>
+          <p>No evidence rows are available from Neo4j.</p>
+        </div>
+      </section>
+    );
+  }
+  return (
+    <section className="evidenceCards">
+      {cards.map((row, index) => (
+        <article className="evidenceCard" key={`${row["Future Appointment"]}-${row["Past Appointment"]}-${index}`}>
+          <div className="evidenceCardTop">
+            <b>{row["Future Pet"] || row["Future Appointment"]}</b>
+            <span>{row["Future Date"]} · similarity {row.Similarity}</span>
+          </div>
+          <div className="evidencePair">
+            <div>
+              <small>Future complaint</small>
+              <p>{row["Future Complaint"] || "-"}</p>
+            </div>
+            <div>
+              <small>Matched invoice visit</small>
+              <p>{row["Past Appointment"]} · {row["Past Date"]}</p>
+            </div>
+          </div>
+          <div className="invoiceSnippet">
+            <small>Invoice evidence</small>
+            <p>{row["Invoice Items"] || "-"}</p>
+          </div>
+        </article>
+      ))}
+    </section>
+  );
+}
+
 function EvidenceTable({ title, rows }) {
-  const headers = rows[0] ? Object.keys(rows[0]) : [];
+  const headers = rows[0] ? Object.keys(rows[0]).filter((header) => !header.startsWith("_")) : [];
   return (
     <div className="evidencePanel">
       <h4>{title}</h4>
@@ -594,7 +491,7 @@ function ChatWidget({ open, setOpen, messages, chatInput, setChatInput, sendMess
           <div className="chatHeader">
             <div>
               <strong>Inventory assistant</strong>
-              <span>Fast KG answers, Codex for deeper analysis</span>
+              <span>Ask why, quantity, vendor, or evidence questions</span>
             </div>
             <button onClick={() => setOpen(false)} aria-label="Close chat">x</button>
           </div>
@@ -606,13 +503,13 @@ function ChatWidget({ open, setOpen, messages, chatInput, setChatInput, sendMess
                 {message.source ? <small>{sourceLabel(message.source)}</small> : null}
               </div>
             ))}
-            {busy ? <div className="message assistant"><b>Assistant</b><p>Checking the KG inventory...</p></div> : null}
+            {busy ? <div className="message assistant"><b>Assistant</b><p>Checking forecast evidence...</p></div> : null}
           </div>
           <form className="chatForm" onSubmit={sendMessage}>
             <input
               value={chatInput}
               onChange={(event) => setChatInput(event.target.value)}
-              placeholder="Quantity needed? Supplier or price? Why included?"
+              placeholder="Why is Gabapentin here?"
             />
             <button disabled={busy || !chatInput.trim()}>Ask</button>
           </form>

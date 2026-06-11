@@ -34,10 +34,14 @@ from starlette.staticfiles import StaticFiles
 load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
+load_dotenv(BASE_DIR.parent / ".env")
 FRONTEND_DIR = BASE_DIR / "react_app"
 CLINIC_NAME = "Florida Plantation Clinic"
 GRAPH_GAP_LABEL = "Not in graph"
 KG_VENDOR_OPTION = "Use KG supplier"
+STOCKABLE_CLASSES = {"INVENTORY", "PRESCRIPTION"}
+MIN_SUPPORT_CASES = 3
 VENDOR_CATALOG = {
     "Amazon": {
         "website": "https://www.amazon.com",
@@ -76,12 +80,15 @@ QUANTITY_RE = re.compile(r"[-+]?\d*\.?\d+")
 CACHE_TTL_SECONDS = 300
 MAX_PAYLOAD_CACHE_ENTRIES = 64
 PAYLOAD_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+EVIDENCE_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 
 
 def get_driver() -> Driver:
+    username = os.getenv("NEO4J_USERNAME") or os.getenv("NEO4J_USER") or os.getenv("E") or "neo4j"
     driver = GraphDatabase.driver(
         os.environ["NEO4J_URI"],
-        auth=(os.environ["NEO4J_USERNAME"], os.environ["NEO4J_PASSWORD"]),
+        auth=(username, os.environ["NEO4J_PASSWORD"]),
+        connection_timeout=5,
     )
     driver.verify_connectivity()
     return driver
@@ -505,11 +512,12 @@ def build_inventory_sheet(predictions: pd.DataFrame, purchase_date: date, vendor
                 "Medication Name",
                 "Product Type",
                 "Quantity Needed",
+                "Expected Units",
                 "Unit Size",
-                "Minimum Quantity",
+                "Forecasted Appointments",
                 "Date To Purchase",
                 "Supplier or Store",
-                "Price Paid",
+                "Expected Cost",
             ]
         )
 
@@ -527,10 +535,12 @@ def build_inventory_sheet(predictions: pd.DataFrame, purchase_date: date, vendor
                 "Medication Name": row["Medication name"],
                 "Product Type": "Medication",
                 "Quantity Needed": quantity_needed,
+                "Expected Units": quantity_needed,
                 "Unit Size": row["Typical dose/unit"],
-                "Minimum Quantity": quantity_needed,
+                "Forecasted Appointments": int(row.get("Seen in appointments") or 0),
                 "Date To Purchase": purchase_date.isoformat(),
                 "Supplier or Store": supplier,
+                "Expected Cost": price_text,
                 "Price Paid": price_text,
             }
         )
@@ -552,7 +562,7 @@ def build_vendor_invoice(inventory: pd.DataFrame, vendor: str) -> list[dict[str,
                 "Medication Name": item_name,
                 "Quantity": quantity,
                 "Unit Size": row["Unit Size"],
-                "Price": row["Price Paid"],
+                "Price": row.get("Expected Cost") or row.get("Price Paid") or "Vendor quote needed",
                 "Search URL": vendor_search_url(vendor, item_name),
                 "Website": metadata.get("website", ""),
                 "Cart Status": "Ready for cart draft" if vendor != KG_VENDOR_OPTION else "Using KG supplier value",
@@ -582,117 +592,768 @@ def build_provenance_summary(predictions: pd.DataFrame) -> list[dict[str, Any]]:
     return rows
 
 
-def build_inventory_payload(params: dict[str, Any]) -> dict[str, Any]:
-    min_graph_date, max_graph_date = get_episode_date_bounds()
-    today = date.today()
-    appointment_query = clean_text(params.get("appointmentReason")) or "wellness exam"
-    appointment_date = parse_date(params.get("appointmentDate")) or today + timedelta(days=7)
-    history_start = parse_date(params.get("historyStart")) or max(min_graph_date, max_graph_date - timedelta(days=540))
-    history_end = parse_date(params.get("historyEnd")) or max_graph_date
-    similar_limit = int(parse_number(params.get("maxSimilar")) or 80)
-    similar_limit = max(10, min(300, similar_limit))
-    species = clean_text(params.get("species")) or "all"
-    life_stage = clean_text(params.get("lifeStage")) or "all"
-    forecast_scope = clean_text(params.get("forecastScope")) or "whole_episode"
-    if forecast_scope not in {"whole_episode", "day1"}:
-        forecast_scope = "whole_episode"
-    include_procedural = bool(params.get("includeProcedural"))
-    min_cases = int(parse_number(params.get("minCases")) or 3)
-    min_cases = max(1, min(20, min_cases))
-    vendor = normalize_vendor(params.get("vendor"))
-    purchase_date = max(today, appointment_date - timedelta(days=2))
+def graph_credentials_available() -> bool:
+    return bool(os.getenv("NEO4J_URI") and os.getenv("NEO4J_PASSWORD"))
 
-    similar = load_similar_appointments(
-        appointment_query,
-        history_start.isoformat(),
-        history_end.isoformat(),
-        similar_limit,
-        species,
-        life_stage,
+
+def require_graph_credentials() -> None:
+    if not graph_credentials_available():
+        raise RuntimeError("Neo4j credentials are required for this dashboard.")
+
+
+def strict_graph_health() -> dict[str, Any]:
+    require_graph_credentials()
+    return get_graph_health()
+
+
+def forecast_item_parts(item_name: Any) -> tuple[str, str]:
+    parts = [part.strip() for part in clean_text(item_name).split("|") if part.strip()]
+    if not parts:
+        return GRAPH_GAP_LABEL, "Each"
+    return parts[0], " | ".join(parts[1:]) if len(parts) > 1 else "Each"
+
+
+def forecast_options_from_rows(rows: pd.DataFrame) -> list[dict[str, Any]]:
+    options: list[dict[str, Any]] = []
+    for _, row in rows.iterrows():
+        complaint = clean_text(row.get("complaint"))
+        label = (
+            f"{row.get('date')} · {row.get('pet')} · "
+            f"{row.get('species')} {row.get('life_stage')} · {complaint[:70]}"
+        )
+        options.append(
+            {
+                "id": row.get("appointment_id"),
+                "label": label,
+                "date": row.get("date"),
+                "pet": row.get("pet"),
+                "species": row.get("species"),
+                "lifeStage": row.get("life_stage"),
+                "complaint": complaint,
+                "expectedTotalCost": 0,
+                "stockableRows": 0,
+                "evidenceCount": int(row.get("evidence_count") or 0),
+            }
+        )
+    return options
+
+
+def load_kg_forecast_options() -> list[dict[str, Any]]:
+    require_graph_credentials()
+    rows = run_query(
+        """
+        MATCH (pet:Patient)-[:HAS_APPOINTMENT]->(appointment:Appointment)
+        WHERE coalesce(appointment.is_future, false) = true
+        OPTIONAL MATCH (appointment)-[:EVIDENCED_BY]->(past:Appointment)
+        WITH appointment, pet, count(past) AS evidence_count
+        RETURN
+            appointment.appointment_id AS appointment_id,
+            pet.name AS pet,
+            coalesce(appointment.species, pet.species) AS species,
+            coalesce(appointment.life_stage, pet.life_stage) AS life_stage,
+            toString(appointment.scheduled_date) AS date,
+            coalesce(appointment.chief_complaint, appointment.presenting_complaint, "") AS complaint,
+            evidence_count
+        ORDER BY appointment.scheduled_date, appointment.appointment_id
+        """
     )
-    episode_ids = similar["episode_id"].dropna().tolist() if not similar.empty else []
-    medication_lines = prepare_medication_lines(load_medication_lines(episode_ids, forecast_scope, include_procedural))
-    predictions = build_medication_predictions(medication_lines, len(similar), min_cases)
-    inventory = build_inventory_sheet(predictions, purchase_date, vendor)
+    if rows.empty:
+        raise RuntimeError("No future appointments were found in Neo4j. Run seed_future_appointments.py and generate_forecast.py first.")
+    return forecast_options_from_rows(rows)
+
+
+def load_kg_future_appointment_count() -> int:
+    require_graph_credentials()
+    rows = run_query(
+        """
+        MATCH (appointment:Appointment)
+        WHERE coalesce(appointment.is_future, false) = true
+        RETURN count(appointment) AS future_count
+        """
+    )
+    return int(rows.iloc[0]["future_count"]) if not rows.empty else 0
+
+
+def load_kg_future_summary() -> dict[str, Any]:
+    require_graph_credentials()
+    rows = run_query(
+        """
+        MATCH (appointment:Appointment)
+        WHERE coalesce(appointment.is_future, false) = true
+        OPTIONAL MATCH (appointment)-[edge:EVIDENCED_BY]->(:Appointment)
+        RETURN
+            count(DISTINCT appointment) AS forecast_visits,
+            count(edge) AS evidence_links,
+            min(toString(appointment.scheduled_date)) AS start_date,
+            max(toString(appointment.scheduled_date)) AS end_date
+        """
+    )
+    if rows.empty:
+        return {
+            "forecast_visits": 0,
+            "evidence_links": 0,
+            "start_date": date.today().isoformat(),
+            "end_date": date.today().isoformat(),
+        }
+    row = rows.iloc[0]
+    return {
+        "forecast_visits": int(row.get("forecast_visits") or 0),
+        "evidence_links": int(row.get("evidence_links") or 0),
+        "start_date": clean_text(row.get("start_date")) or date.today().isoformat(),
+        "end_date": clean_text(row.get("end_date")) or date.today().isoformat(),
+    }
+
+
+def load_kg_total_expected_billing() -> float:
+    require_graph_credentials()
+    rows = run_query(
+        """
+        MATCH (future:Appointment)
+        WHERE coalesce(future.is_future, false) = true
+        MATCH (future)-[:EVIDENCED_BY]->(past:Appointment)
+        WITH future, collect(DISTINCT past.appointment_id) AS past_ids, count(DISTINCT past) AS k
+        WHERE k > 0
+        MATCH (past:Appointment)-[:HAS_INVOICE]->(:Invoice)-[:HAS_INVOICE]->(invoice_item:Item)
+        WHERE past.appointment_id IN past_ids
+        WITH future, k, sum(toFloat(coalesce(invoice_item.charged_price, invoice_item.item_unit_price, 0.0))) AS total_cost
+        WITH future, total_cost * 1.0 / k AS expected_cost
+        RETURN round(sum(expected_cost), 2) AS expected_total
+        """
+    )
+    if rows.empty:
+        return 0.0
+    return float(rows.iloc[0].get("expected_total") or 0.0)
+
+
+def load_kg_forecast(params: dict[str, Any]) -> dict[str, Any]:
+    require_graph_credentials()
+    requested_id = clean_text(params.get("forecastId") or params.get("appointmentId"))
+    if requested_id:
+        appointment_rows = run_query(
+            """
+            MATCH (pet:Patient)-[:HAS_APPOINTMENT]->(appointment:Appointment {appointment_id:$appointment_id})
+            WHERE coalesce(appointment.is_future, false) = true
+            OPTIONAL MATCH (appointment)-[:EVIDENCED_BY]->(past:Appointment)
+            WITH appointment, pet, count(past) AS evidence_count
+            RETURN
+                appointment.appointment_id AS appointment_id,
+                pet.name AS pet,
+                coalesce(appointment.species, pet.species) AS species,
+                coalesce(appointment.life_stage, pet.life_stage) AS life_stage,
+                toString(appointment.scheduled_date) AS date,
+                coalesce(appointment.chief_complaint, appointment.presenting_complaint, "") AS complaint,
+                evidence_count
+            LIMIT 1
+            """,
+            {"appointment_id": requested_id},
+        )
+    else:
+        appointment_rows = run_query(
+            """
+            MATCH (pet:Patient)-[:HAS_APPOINTMENT]->(appointment:Appointment)
+            WHERE coalesce(appointment.is_future, false) = true
+            OPTIONAL MATCH (appointment)-[:EVIDENCED_BY]->(past:Appointment)
+            WITH appointment, pet, count(past) AS evidence_count
+            RETURN
+                appointment.appointment_id AS appointment_id,
+                pet.name AS pet,
+                coalesce(appointment.species, pet.species) AS species,
+                coalesce(appointment.life_stage, pet.life_stage) AS life_stage,
+                toString(appointment.scheduled_date) AS date,
+                coalesce(appointment.chief_complaint, appointment.presenting_complaint, "") AS complaint,
+                evidence_count
+            ORDER BY appointment.scheduled_date, appointment.appointment_id
+            LIMIT 1
+            """
+        )
+    if appointment_rows.empty:
+        raise RuntimeError("The selected future appointment was not found in Neo4j.")
+
+    appointment = appointment_rows.iloc[0].to_dict()
+    similar_count = int(appointment.get("evidence_count") or 0)
+    if similar_count == 0:
+        raise RuntimeError(
+            f"Future appointment {appointment['appointment_id']} has no EVIDENCED_BY forecast edges in Neo4j. "
+            "Run scripts/generate_forecast.py before opening the dashboard."
+        )
+
+    line_rows = run_query(
+        """
+        MATCH (future:Appointment {appointment_id:$appointment_id})-[:EVIDENCED_BY]->(past:Appointment)
+        WITH collect(DISTINCT past.appointment_id) AS past_ids, count(DISTINCT past) AS k
+        MATCH (past:Appointment)-[:HAS_INVOICE]->(:Invoice)-[:HAS_INVOICE]->(invoice_item:Item)
+        WHERE past.appointment_id IN past_ids
+          AND invoice_item.line_name IS NOT NULL
+        WITH k,
+             invoice_item.line_name AS item,
+             coalesce(invoice_item.class, "UNKNOWN") AS class,
+             count(DISTINCT past.appointment_id) AS support,
+             sum(toFloat(coalesce(invoice_item.total_quanity, 1.0))) AS total_qty,
+             sum(toFloat(coalesce(invoice_item.charged_price, invoice_item.item_unit_price, 0.0))) AS total_cost
+        RETURN
+            item,
+            class,
+            support,
+            round(support * 1.0 / k, 2) AS prevalence,
+            round(total_qty * 1.0 / k, 2) AS expected_units,
+            round(total_cost * 1.0 / k, 2) AS expected_cost
+        ORDER BY prevalence DESC, expected_cost DESC, item
+        """,
+        {"appointment_id": appointment["appointment_id"]},
+    )
+    if line_rows.empty:
+        raise RuntimeError(f"Neo4j returned no invoice item rows for forecast {appointment['appointment_id']}.")
+    lines = line_rows.to_dict(orient="records")
+    return {
+        "appointment_id": appointment["appointment_id"],
+        "pet": appointment.get("pet"),
+        "species": appointment.get("species"),
+        "life_stage": appointment.get("life_stage"),
+        "date": appointment.get("date"),
+        "complaint": appointment.get("complaint"),
+        "n_similar": similar_count,
+        "expected_total_cost": round(sum(float(line.get("expected_cost") or 0) for line in lines), 2),
+        "lines": lines,
+    }
+
+
+def forecast_line_support(forecast: dict[str, Any], line: dict[str, Any]) -> int:
+    if parse_number(line.get("support")) is not None:
+        return int(parse_number(line.get("support")) or 0)
+    similar_count = int(forecast.get("n_similar") or 0)
+    return int(round(float(line.get("prevalence") or 0) * similar_count))
+
+
+def all_stockable_forecast_lines(forecast: dict[str, Any]) -> list[dict[str, Any]]:
+    return [line for line in forecast.get("lines", []) if line.get("class") in STOCKABLE_CLASSES]
+
+
+def stockable_forecast_lines(forecast: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        line
+        for line in all_stockable_forecast_lines(forecast)
+        if forecast_line_support(forecast, line) >= MIN_SUPPORT_CASES
+    ]
+
+
+def money(value: Any) -> str:
+    number = parse_number(value)
+    if number is None:
+        return GRAPH_GAP_LABEL
+    return f"${number:,.2f}"
+
+
+def purchase_date_for_forecast(forecast: dict[str, Any]) -> date:
+    appointment_date = parse_date(forecast.get("date")) or date.today() + timedelta(days=7)
+    return max(date.today(), appointment_date - timedelta(days=2))
+
+
+def build_inventory_from_forecast(forecast: dict[str, Any], vendor: str) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    purchase_date = purchase_date_for_forecast(forecast).isoformat()
+    for line in stockable_forecast_lines(forecast):
+        name, unit_size = forecast_item_parts(line.get("item"))
+        expected_units = float(line.get("expected_units") or 0)
+        expected_cost = float(line.get("expected_cost") or 0)
+        quantity_needed = max(1, int(math.ceil(expected_units)))
+        supplier = vendor if vendor != KG_VENDOR_OPTION else GRAPH_GAP_LABEL
+        rows.append(
+            {
+                "Medication Name": name,
+                "Product Type": line.get("class", "Medication"),
+                "Quantity Needed": quantity_needed,
+                "Expected Units": round(expected_units, 2),
+                "Unit Size": unit_size,
+                "Forecasted Appointments": forecast_line_support(forecast, line),
+                "Date To Purchase": purchase_date,
+                "Supplier or Store": supplier,
+                "Expected Cost": money(expected_cost) if expected_cost > 0 else "Vendor quote needed",
+                "Price Paid": money(expected_cost) if expected_cost > 0 else "Vendor quote needed",
+                "_sourceItem": line.get("item"),
+                "_expectedUnits": round(expected_units, 2),
+                "_expectedCost": round(expected_cost, 2),
+                "_prevalence": round(float(line.get("prevalence") or 0), 2),
+                "_supportCases": forecast_line_support(forecast, line),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def build_charge_lines(forecast: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for line in forecast.get("lines", []):
+        rows.append(
+            {
+                "Charge Item": line.get("item"),
+                "Class": line.get("class"),
+                "Expected Units": line.get("expected_units"),
+                "Expected Cost": money(line.get("expected_cost")),
+            }
+        )
+    return rows
+
+
+def build_forecast_provenance(forecast: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    similar_count = int(forecast.get("n_similar") or 0)
+    for line in stockable_forecast_lines(forecast):
+        name, unit_size = forecast_item_parts(line.get("item"))
+        support = forecast_line_support(forecast, line)
+        rows.append(
+            {
+                "Medication": name,
+                "Product Type": line.get("class"),
+                "Quantity Needed": max(1, int(math.ceil(float(line.get("expected_units") or 0)))),
+                "Unit Size": unit_size,
+                "Historical Invoice Support": f"{support} of {similar_count} similar visits",
+                "Expected Cost": money(line.get("expected_cost")),
+            }
+        )
+    return rows
+
+
+def build_inventory_rollup(vendor: str) -> list[dict[str, Any]]:
+    require_graph_credentials()
+    rows = run_query(
+        """
+        MATCH (future:Appointment)
+        WHERE coalesce(future.is_future, false) = true
+        MATCH (future)-[:EVIDENCED_BY]->(past:Appointment)
+        WITH future, collect(DISTINCT past.appointment_id) AS past_ids, count(DISTINCT past) AS k
+        WHERE k > 0
+        MATCH (past:Appointment)-[:HAS_INVOICE]->(:Invoice)-[:HAS_INVOICE]->(invoice_item:Item)
+        WHERE past.appointment_id IN past_ids
+          AND invoice_item.class IN $stockable_classes
+          AND invoice_item.line_name IS NOT NULL
+        WITH future, k,
+             invoice_item.line_name AS item,
+             coalesce(invoice_item.class, "UNKNOWN") AS class,
+             count(DISTINCT past.appointment_id) AS support,
+             sum(toFloat(coalesce(invoice_item.total_quanity, 1.0))) AS total_qty,
+             sum(toFloat(coalesce(invoice_item.charged_price, invoice_item.item_unit_price, 0.0))) AS total_cost
+        WHERE support >= $min_support
+        WITH future, item, class, total_qty * 1.0 / k AS expected_units, total_cost * 1.0 / k AS expected_cost
+        WITH item, class,
+             sum(expected_units) AS expected_units,
+             sum(expected_cost) AS expected_cost,
+             count(DISTINCT future) AS appointments
+        RETURN item, class, expected_units, expected_cost, appointments
+        ORDER BY expected_units DESC
+        LIMIT 50
+        """,
+        {"stockable_classes": list(STOCKABLE_CLASSES), "min_support": MIN_SUPPORT_CASES},
+    )
+
+    rollup_rows: list[dict[str, Any]] = []
+    for _, row in rows.iterrows():
+        name, unit_size = forecast_item_parts(row.get("item"))
+        expected_units = float(row.get("expected_units") or 0)
+        expected_cost = float(row.get("expected_cost") or 0)
+        rollup_rows.append(
+            {
+                "Medication Name": name,
+                "Product Type": row.get("class"),
+                "Unit Size": unit_size,
+                "Expected Units": round(expected_units, 1),
+                "Expected Cost": money(expected_cost),
+                "Appointments": int(row.get("appointments") or 0),
+                "Supplier or Store": vendor if vendor != KG_VENDOR_OPTION else GRAPH_GAP_LABEL,
+                "Order Units": max(1, int(math.ceil(expected_units))),
+                "_sourceItem": row.get("item"),
+                "_expectedUnits": round(expected_units, 2),
+                "_expectedCost": round(expected_cost, 2),
+            }
+        )
+    return rollup_rows
+
+
+def build_inventory_from_rollup(rollup: list[dict[str, Any]], vendor: str, purchase_date: date) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for row in rollup:
+        expected_cost = float(row.get("_expectedCost") or 0)
+        expected_cost_text = money(expected_cost) if expected_cost > 0 else "Vendor quote needed"
+        rows.append(
+            {
+                "Medication Name": row.get("Medication Name"),
+                "Product Type": row.get("Product Type") or "Medication",
+                "Quantity Needed": int(row.get("Order Units") or 1),
+                "Expected Units": row.get("_expectedUnits"),
+                "Unit Size": row.get("Unit Size") or "Each",
+                "Forecasted Appointments": row.get("Appointments"),
+                "Date To Purchase": purchase_date.isoformat(),
+                "Supplier or Store": vendor if vendor != KG_VENDOR_OPTION else row.get("Supplier or Store", GRAPH_GAP_LABEL),
+                "Expected Cost": expected_cost_text,
+                "Cost Source": "Historical invoices" if expected_cost > 0 else "Vendor quote needed",
+                "Price Paid": expected_cost_text,
+                "_sourceItem": row.get("_sourceItem"),
+                "_expectedUnits": row.get("_expectedUnits"),
+                "_expectedCost": row.get("_expectedCost"),
+                "_appointments": row.get("Appointments"),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def build_aggregate_charge_lines(rollup: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "Charge Item": row.get("_sourceItem") or row.get("Medication Name"),
+            "Class": row.get("Product Type"),
+            "Expected Units": row.get("Expected Units"),
+            "Expected Cost": row.get("Expected Cost"),
+            "Future Appointments": row.get("Appointments"),
+        }
+        for row in rollup
+    ]
+
+
+def build_aggregate_provenance(rollup: list[dict[str, Any]], summary: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for row in rollup:
+        rows.append(
+            {
+                "Medication": row.get("Medication Name"),
+                "Product Type": row.get("Product Type"),
+                "Quantity Needed": row.get("Order Units"),
+                "Unit Size": row.get("Unit Size"),
+                "Forecasted Appointments": row.get("Appointments"),
+                "Forecast Period": f"{summary.get('start_date')} to {summary.get('end_date')}",
+                "Expected Cost": row.get("Expected Cost"),
+            }
+        )
+    return rows
+
+
+def purchase_date_for_future_summary(summary: dict[str, Any]) -> date:
+    start = parse_date(summary.get("start_date")) or date.today()
+    return max(date.today(), start - timedelta(days=2))
+
+
+def load_evidence_trail(forecast: dict[str, Any], item_name: str = "", limit: int = 12) -> list[dict[str, Any]]:
+    item_name = clean_text(item_name)
+    cache_key = json.dumps(
+        {"appointment_id": forecast.get("appointment_id"), "item_name": item_name, "limit": limit},
+        sort_keys=True,
+    )
+    cached = EVIDENCE_CACHE.get(cache_key)
+    now = time.monotonic()
+    if cached and now - cached[0] <= CACHE_TTL_SECONDS:
+        return cached[1]
+    require_graph_credentials()
+    try:
+        if item_name:
+            rows = run_query(
+                """
+                MATCH (future:Appointment {appointment_id:$appointment_id})-[r:EVIDENCED_BY]->(past:Appointment)
+                MATCH (past)-[:HAS_INVOICE]->(:Invoice)-[:HAS_INVOICE]->(invoice_item:Item)
+                WHERE toLower(coalesce(invoice_item.line_name, "")) = toLower($item_name)
+                OPTIONAL MATCH (pet:Patient)-[:HAS_APPOINTMENT]->(past)
+                WITH past, pet, r,
+                     collect({
+                        name: invoice_item.line_name,
+                        class: coalesce(invoice_item.class, ""),
+                        qty: coalesce(invoice_item.total_quanity, 1.0),
+                        price: coalesce(invoice_item.charged_price, invoice_item.item_unit_price, 0.0)
+                     })[0..4] AS items
+                RETURN
+                    coalesce(r.rank, 999) + 1 AS rank,
+                    past.appointment_id AS appointment_id,
+                    pet.name AS pet,
+                    coalesce(past.chief_complaint, past.presenting_complaint, "") AS complaint,
+                    coalesce(toString(past.scheduled_date), toString(past.appointment_date), "") AS appointment_date,
+                    coalesce(past.species, pet.species) AS species,
+                    coalesce(past.life_stage, pet.life_stage) AS life_stage,
+                    r.score AS score,
+                    items AS invoice_items
+                ORDER BY rank
+                LIMIT $limit
+                """,
+                {"appointment_id": forecast["appointment_id"], "item_name": item_name, "limit": limit},
+            )
+        else:
+            rows = run_query(
+                """
+                MATCH (future:Appointment {appointment_id:$appointment_id})-[r:EVIDENCED_BY]->(past:Appointment)
+                OPTIONAL MATCH (pet:Patient)-[:HAS_APPOINTMENT]->(past)
+                OPTIONAL MATCH (past)-[:HAS_INVOICE]->(:Invoice)-[:HAS_INVOICE]->(invoice_item:Item)
+                WITH past, pet, r,
+                     collect({
+                        name: coalesce(invoice_item.line_name, ""),
+                        class: coalesce(invoice_item.class, ""),
+                        qty: coalesce(invoice_item.total_quanity, 1.0),
+                        price: coalesce(invoice_item.charged_price, invoice_item.item_unit_price, 0.0)
+                     }) AS raw_items
+                WITH past, pet, r, [item IN raw_items WHERE item.name <> ""][0..4] AS items
+                RETURN
+                    coalesce(r.rank, 999) + 1 AS rank,
+                    past.appointment_id AS appointment_id,
+                    pet.name AS pet,
+                    coalesce(past.chief_complaint, past.presenting_complaint, "") AS complaint,
+                    coalesce(toString(past.scheduled_date), toString(past.appointment_date), "") AS appointment_date,
+                    coalesce(past.species, pet.species) AS species,
+                    coalesce(past.life_stage, pet.life_stage) AS life_stage,
+                    r.score AS score,
+                    items AS invoice_items
+                ORDER BY rank
+                LIMIT $limit
+                """,
+                {"appointment_id": forecast["appointment_id"], "limit": limit},
+            )
+    except Exception as exc:
+        raise RuntimeError("Neo4j evidence query failed.") from exc
+    if rows.empty:
+        return []
+
+    trail: list[dict[str, Any]] = []
+    for _, row in rows.iterrows():
+        items = row.get("invoice_items") or []
+        item_text = "; ".join(
+            f"{item.get('name')} ({item.get('class')}, qty {item.get('qty')}, {money(item.get('price'))})"
+            for item in items[:4]
+            if isinstance(item, dict) and item.get("name")
+        )
+        trail.append(
+            {
+                "Rank": int(row.get("rank") or len(trail) + 1),
+                "Past Appointment": row.get("appointment_id"),
+                "Pet": row.get("pet") or "",
+                "Date": row.get("appointment_date") or "",
+                "Complaint": row.get("complaint") or "",
+                "Cohort": f"{row.get('species') or ''} · {row.get('life_stage') or ''}",
+                "Similarity": round(float(row.get("score") or 0), 3),
+                "Invoice Items": item_text or GRAPH_GAP_LABEL,
+            }
+        )
+    EVIDENCE_CACHE[cache_key] = (now, trail)
+    if len(EVIDENCE_CACHE) > MAX_PAYLOAD_CACHE_ENTRIES * 4:
+        oldest_key = min(EVIDENCE_CACHE, key=lambda item: EVIDENCE_CACHE[item][0])
+        EVIDENCE_CACHE.pop(oldest_key, None)
+    return trail
+
+
+def load_aggregate_evidence_sample(limit: int = 12) -> list[dict[str, Any]]:
+    cache_key = json.dumps({"scope": "all_future", "limit": limit}, sort_keys=True)
+    cached = EVIDENCE_CACHE.get(cache_key)
+    now = time.monotonic()
+    if cached and now - cached[0] <= CACHE_TTL_SECONDS:
+        return cached[1]
+    require_graph_credentials()
+    rows = run_query(
+        """
+        MATCH (future:Appointment)
+        WHERE coalesce(future.is_future, false) = true
+        MATCH (future)-[r:EVIDENCED_BY]->(past:Appointment)
+        OPTIONAL MATCH (future_pet:Patient)-[:HAS_APPOINTMENT]->(future)
+        OPTIONAL MATCH (past_pet:Patient)-[:HAS_APPOINTMENT]->(past)
+        OPTIONAL MATCH (past)-[:HAS_INVOICE]->(:Invoice)-[:HAS_INVOICE]->(invoice_item:Item)
+        WITH future, future_pet, past, past_pet, r,
+             collect({
+                name: coalesce(invoice_item.line_name, ""),
+                class: coalesce(invoice_item.class, ""),
+                qty: coalesce(invoice_item.total_quanity, 1.0),
+                price: coalesce(invoice_item.charged_price, invoice_item.item_unit_price, 0.0)
+             }) AS raw_items
+        WITH future, future_pet, past, past_pet, r, [item IN raw_items WHERE item.name <> ""][0..4] AS items
+        RETURN
+            future.appointment_id AS future_id,
+            future_pet.name AS future_pet,
+            toString(future.scheduled_date) AS future_date,
+            coalesce(future.chief_complaint, future.presenting_complaint, "") AS future_complaint,
+            coalesce(r.rank, 999) + 1 AS rank,
+            past.appointment_id AS past_id,
+            past_pet.name AS past_pet,
+            coalesce(past.chief_complaint, past.presenting_complaint, "") AS past_complaint,
+            coalesce(toString(past.scheduled_date), toString(past.appointment_date), "") AS past_date,
+            r.score AS score,
+            items AS invoice_items
+        ORDER BY future.scheduled_date, future.appointment_id, rank
+        LIMIT $limit
+        """,
+        {"limit": limit},
+    )
+    if rows.empty:
+        return []
+    trail: list[dict[str, Any]] = []
+    for _, row in rows.iterrows():
+        items = row.get("invoice_items") or []
+        item_text = "; ".join(
+            f"{item.get('name')} ({item.get('class')}, qty {item.get('qty')}, {money(item.get('price'))})"
+            for item in items[:4]
+            if isinstance(item, dict) and item.get("name")
+        )
+        trail.append(
+            {
+                "Future Appointment": row.get("future_id"),
+                "Future Date": row.get("future_date"),
+                "Future Pet": row.get("future_pet") or "",
+                "Future Complaint": row.get("future_complaint") or "",
+                "Evidence Rank": int(row.get("rank") or len(trail) + 1),
+                "Past Appointment": row.get("past_id"),
+                "Past Date": row.get("past_date") or "",
+                "Past Complaint": row.get("past_complaint") or "",
+                "Similarity": round(float(row.get("score") or 0), 3),
+                "Invoice Items": item_text or GRAPH_GAP_LABEL,
+            }
+        )
+    EVIDENCE_CACHE[cache_key] = (now, trail)
+    return trail
+
+
+def load_rollup_item_evidence(item_name: str, limit: int = 8) -> list[dict[str, Any]]:
+    item_name = clean_text(item_name)
+    if not item_name:
+        return []
+    cache_key = json.dumps({"scope": "all_future", "item_name": item_name, "limit": limit}, sort_keys=True)
+    cached = EVIDENCE_CACHE.get(cache_key)
+    now = time.monotonic()
+    if cached and now - cached[0] <= CACHE_TTL_SECONDS:
+        return cached[1]
+    require_graph_credentials()
+    rows = run_query(
+        """
+        MATCH (future:Appointment)
+        WHERE coalesce(future.is_future, false) = true
+        MATCH (future)-[r:EVIDENCED_BY]->(past:Appointment)
+        MATCH (past)-[:HAS_INVOICE]->(:Invoice)-[:HAS_INVOICE]->(invoice_item:Item)
+        WHERE toLower(coalesce(invoice_item.line_name, "")) = toLower($item_name)
+        OPTIONAL MATCH (future_pet:Patient)-[:HAS_APPOINTMENT]->(future)
+        OPTIONAL MATCH (past_pet:Patient)-[:HAS_APPOINTMENT]->(past)
+        WITH future, future_pet, past, past_pet, r,
+             collect({
+                name: invoice_item.line_name,
+                class: coalesce(invoice_item.class, ""),
+                qty: coalesce(invoice_item.total_quanity, 1.0),
+                price: coalesce(invoice_item.charged_price, invoice_item.item_unit_price, 0.0)
+             })[0..4] AS items
+        RETURN
+            future.appointment_id AS future_id,
+            future_pet.name AS future_pet,
+            toString(future.scheduled_date) AS future_date,
+            coalesce(future.chief_complaint, future.presenting_complaint, "") AS future_complaint,
+            coalesce(r.rank, 999) + 1 AS rank,
+            past.appointment_id AS past_id,
+            past_pet.name AS past_pet,
+            coalesce(past.chief_complaint, past.presenting_complaint, "") AS past_complaint,
+            coalesce(toString(past.scheduled_date), toString(past.appointment_date), "") AS past_date,
+            r.score AS score,
+            items AS invoice_items
+        ORDER BY future.scheduled_date, future.appointment_id, rank
+        LIMIT $limit
+        """,
+        {"item_name": item_name, "limit": limit},
+    )
+    if rows.empty:
+        return []
+    trail: list[dict[str, Any]] = []
+    for _, row in rows.iterrows():
+        items = row.get("invoice_items") or []
+        item_text = "; ".join(
+            f"{item.get('name')} ({item.get('class')}, qty {item.get('qty')}, {money(item.get('price'))})"
+            for item in items[:4]
+            if isinstance(item, dict) and item.get("name")
+        )
+        trail.append(
+            {
+                "Future Appointment": row.get("future_id"),
+                "Future Date": row.get("future_date"),
+                "Future Pet": row.get("future_pet") or "",
+                "Future Complaint": row.get("future_complaint") or "",
+                "Evidence Rank": int(row.get("rank") or len(trail) + 1),
+                "Past Appointment": row.get("past_id"),
+                "Past Date": row.get("past_date") or "",
+                "Past Complaint": row.get("past_complaint") or "",
+                "Similarity": round(float(row.get("score") or 0), 3),
+                "Invoice Items": item_text or GRAPH_GAP_LABEL,
+            }
+        )
+    EVIDENCE_CACHE[cache_key] = (now, trail)
+    return trail
+
+
+def build_inventory_payload(params: dict[str, Any]) -> dict[str, Any]:
+    vendor = normalize_vendor(params.get("vendor"))
+    summary = load_kg_future_summary()
+    rollup = build_inventory_rollup(vendor)
+    purchase_date = purchase_date_for_future_summary(summary)
+    inventory = build_inventory_from_rollup(rollup, vendor, purchase_date)
     vendor_invoice = build_vendor_invoice(inventory, vendor)
-    graph_health = get_graph_health()
+    charge_lines = build_aggregate_charge_lines(rollup)
+    provenance = build_aggregate_provenance(rollup, summary)
+    evidence_trail = load_aggregate_evidence_sample(limit=12)
+    graph_health = strict_graph_health()
+    total_qty = int(inventory["Quantity Needed"].sum()) if not inventory.empty else 0
+    forecast_count = int(summary.get("forecast_visits") or 0)
+    evidence_count = int(summary.get("evidence_links") or 0)
+    expected_total_cost = load_kg_total_expected_billing()
+    period = f"{summary.get('start_date')} to {summary.get('end_date')}"
 
     return json_safe({
         "clinicName": CLINIC_NAME,
-        "appointmentReason": appointment_query,
-        "appointmentDate": appointment_date.isoformat(),
-        "historyStart": history_start.isoformat(),
-        "historyEnd": history_end.isoformat(),
+        "forecastId": "all_future",
+        "appointmentReason": "All upcoming appointments",
+        "appointmentDate": period,
+        "pet": "All scheduled patients",
+        "historyStart": "",
+        "historyEnd": "",
         "purchaseDate": purchase_date.isoformat(),
-        "maxSimilar": similar_limit,
-        "species": species,
-        "lifeStage": life_stage,
-        "forecastScope": forecast_scope,
-        "includeProcedural": include_procedural,
-        "minCases": min_cases,
+        "maxSimilar": 30,
+        "species": "all",
+        "lifeStage": "all",
+        "forecastScope": "all_future_inventory",
+        "includeProcedural": True,
+        "minCases": MIN_SUPPORT_CASES,
         "vendor": vendor,
         "vendorOptions": VENDOR_OPTIONS,
         "vendorWebsite": vendor_metadata(vendor).get("website", ""),
         "vendorCartMode": vendor_metadata(vendor).get("cart_mode", ""),
+        "forecastOptions": [],
+        "selectedForecast": {
+            "id": "all_future",
+            "date": period,
+            "pet": "All scheduled patients",
+            "species": "all",
+            "lifeStage": "all",
+            "complaint": "All upcoming appointments",
+            "expectedTotalCost": expected_total_cost,
+            "stockableRows": len(inventory),
+        },
         "forecastRules": [
-            "Presentation sign tags only",
-            "Species and life-stage cohort",
-            "Procedural meds excluded by default",
-            "Minimum supporting cases enforced",
-            "Whole episode or day-1 demand",
+            "Every future appointment complaint is embedded once",
+            "Each future appointment is matched to invoice-backed historical appointments",
+            "Historical invoice items are aggregated into clinic-level inventory demand",
+            "EVIDENCED_BY edges preserve the why trail to real past visits",
+            f"Inventory rows require at least {MIN_SUPPORT_CASES} supporting visits per forecast target",
         ],
         "metrics": {
-            "similarAppointments": len(similar),
+            "similarAppointments": forecast_count,
             "medications": len(inventory),
-            "quantityNeeded": int(inventory["Quantity Needed"].sum()) if not inventory.empty else 0,
-            "kgEvidence": len(medication_lines),
-            "noiseFloor": min_cases,
+            "quantityNeeded": total_qty,
+            "kgEvidence": evidence_count,
+            "chargeLines": len(charge_lines),
+            "expectedTotalCost": round(expected_total_cost, 2),
+            "forecastVisits": forecast_count,
+            "fourWeekStockItems": len(rollup),
+            "noiseFloor": MIN_SUPPORT_CASES,
             "graphNodes": graph_health["nodes"],
             "graphRelationships": graph_health["relationships"],
             "database": graph_health["database"],
         },
         "inventory": inventory.to_dict(orient="records"),
         "vendorInvoice": vendor_invoice,
-        "similarAppointments": similar[
-            ["appointment_date", "appointment", "species", "life_stage", "matched_signs", "presentation_signs"]
-        ].to_dict(orient="records")
-        if not similar.empty
-        else [],
-        "medicationEvidence": medication_lines[
-            [
-                "service_date",
-                "appointment",
-                "item",
-                "presentation_sign",
-                "source_reason",
-                "diagnosis_status",
-                "indication_type",
-                "graph_path",
-                "quantity_raw",
-                "supplier",
-                "unit_price",
-            ]
-        ].to_dict(orient="records")
-        if not medication_lines.empty
-        else [],
-        "provenance": build_provenance_summary(predictions),
-        "predictions": predictions.to_dict(orient="records") if not predictions.empty else [],
-        "suggestions": get_appointment_suggestions(),
+        "similarAppointments": evidence_trail,
+        "evidenceTrail": evidence_trail,
+        "medicationEvidence": charge_lines,
+        "chargeLines": charge_lines,
+        "inventoryRollup": rollup,
+        "provenance": provenance,
+        "predictions": provenance,
+        "suggestions": [],
     })
 
 
 def payload_cache_key(params: dict[str, Any]) -> str:
     normalized = {
-        "appointmentReason": clean_text(params.get("appointmentReason")),
-        "appointmentDate": clean_text(params.get("appointmentDate")),
-        "historyStart": clean_text(params.get("historyStart")),
-        "historyEnd": clean_text(params.get("historyEnd")),
-        "maxSimilar": int(parse_number(params.get("maxSimilar")) or 80),
-        "species": clean_text(params.get("species")) or "all",
-        "lifeStage": clean_text(params.get("lifeStage")) or "all",
-        "forecastScope": clean_text(params.get("forecastScope")) or "whole_episode",
-        "includeProcedural": bool(params.get("includeProcedural")),
-        "minCases": int(parse_number(params.get("minCases")) or 3),
+        "scope": "all_future_inventory",
         "vendor": normalize_vendor(params.get("vendor")),
     }
     return json.dumps(normalized, sort_keys=True)
@@ -724,16 +1385,125 @@ def supplier_price_lines(inventory: list[dict[str, Any]]) -> list[str]:
     return [
         (
             f"- {row['Medication Name']}: supplier {row['Supplier or Store']}, "
-            f"price {row['Price Paid']}"
+            f"expected cost {row.get('Expected Cost') or row.get('Price Paid')}"
         )
         for row in inventory
     ]
 
 
+def question_wants_source(text: str) -> bool:
+    return any(word in text for word in ["why", "source", "from", "matched", "similar", "evidence", "appointment", "graph", "trail"])
+
+
+def matching_forecast_line(question: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+    text = question.lower()
+    candidates: list[dict[str, Any]] = []
+    for row in payload.get("inventory", []):
+        candidates.append(row)
+    for row in payload.get("chargeLines", []):
+        source_item = row.get("Charge Item")
+        name, _unit_size = forecast_item_parts(source_item)
+        candidates.append({"Medication Name": name, "_sourceItem": source_item, "_expectedUnits": row.get("Expected Units")})
+
+    def score(candidate: dict[str, Any]) -> int:
+        name = clean_text(candidate.get("Medication Name")).lower()
+        source = clean_text(candidate.get("_sourceItem")).lower()
+        if source and source in text:
+            return len(source)
+        if name and name in text:
+            return len(name)
+        tokens = [token for token in re.findall(r"[a-z0-9]+", name) if len(token) >= 4]
+        return max((len(token) for token in tokens if token in text), default=0)
+
+    scored = [(score(candidate), candidate) for candidate in candidates]
+    scored = [item for item in scored if item[0] > 0]
+    if not scored:
+        return None
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return scored[0][1]
+
+
+def why_answer_for_line(question: str, payload: dict[str, Any], line: dict[str, Any] | None) -> str:
+    if payload.get("forecastScope") == "all_future_inventory":
+        item_name = clean_text(line.get("_sourceItem") if line else "") if line else ""
+        item_label = clean_text(line.get("Medication Name") if line else "")
+        evidence = load_rollup_item_evidence(item_name, limit=8) if item_name else payload.get("evidenceTrail", [])[:8]
+        forecast_count = payload["metrics"].get("forecastVisits", 0)
+        evidence_count = payload["metrics"].get("kgEvidence", 0)
+        period = payload.get("appointmentDate")
+
+        if line:
+            expected_units = line.get("_expectedUnits") or line.get("Quantity Needed")
+            order_units = line.get("Quantity Needed")
+            appointments = line.get("_appointments")
+            appointment_text = f" It appears across {appointments} future appointment forecasts." if appointments else ""
+            header = (
+                f"{item_label} is on the aggregate inventory sheet because Neo4j found matching historical invoice lines "
+                f"behind the upcoming appointment forecasts for {period}.{appointment_text} "
+                f"The rollup expects {expected_units} units, rounded to {order_units} purchase units."
+            )
+        else:
+            header = (
+                f"This sheet is a rollup of {forecast_count} future appointments for {period}. "
+                f"Darshan's pipeline wrote {evidence_count} EVIDENCED_BY links from future visits to similar historical "
+                "invoice-backed visits, then the dashboard aggregates the stockable invoice items."
+            )
+
+        if not evidence:
+            return header
+        examples = []
+        for row in evidence[:5]:
+            examples.append(
+                f"- Future {row.get('Future Appointment')} ({row.get('Future Date', '')}) -> "
+                f"past {row.get('Past Appointment')} ({row.get('Past Date', '')}) · "
+                f"{row.get('Invoice Items', GRAPH_GAP_LABEL)}"
+            )
+        return header + "\n\nEvidence examples:\n" + "\n".join(examples)
+
+    appointment = {
+        "appointment_id": payload.get("forecastId"),
+        "evidence": [row.get("Past Appointment") for row in payload.get("evidenceTrail", []) if row.get("Past Appointment")],
+    }
+    item_name = clean_text(line.get("_sourceItem") if line else "") if line else ""
+    item_label = clean_text(line.get("Medication Name") if line else "")
+    evidence = load_evidence_trail(appointment, item_name, limit=8) if item_name else payload.get("evidenceTrail", [])[:8]
+    similar_count = payload["metrics"].get("similarAppointments", 0)
+    complaint = payload.get("appointmentReason")
+    cohort = f"{payload.get('species')} · {payload.get('lifeStage')}"
+
+    if line:
+        support = ""
+        prevalence = parse_number(line.get("_prevalence"))
+        if prevalence is not None and similar_count:
+            support = f" It appears in about {int(round(prevalence * similar_count))} of {similar_count} similar invoice-backed visits."
+        expected_units = line.get("_expectedUnits") or line.get("Quantity Needed")
+        header = (
+            f"{item_label} is on the sheet because the pipeline matched this future appointment "
+            f"('{complaint}') to {similar_count} similar historical appointments in the {cohort} cohort, "
+            f"then aggregated the real invoice items from those visits.{support} Expected units: {expected_units}."
+        )
+    else:
+        header = (
+            f"This sheet is based on {similar_count} similar historical appointments for '{complaint}' "
+            f"in the {cohort} cohort. The generated pipeline writes EVIDENCED_BY edges from the future appointment "
+            "to those past visits, then reads the past invoice items."
+        )
+
+    if not evidence:
+        return header
+    examples = []
+    for row in evidence[:5]:
+        examples.append(
+            f"- #{row.get('Rank')}: {row.get('Past Appointment')} · {row.get('Date', '')} · "
+            f"{row.get('Complaint', '')} · {row.get('Invoice Items', GRAPH_GAP_LABEL)}"
+        )
+    return header + "\n\nEvidence examples:\n" + "\n".join(examples)
+
+
 def fast_inventory_answer(question: str, payload: dict[str, Any]) -> str | None:
     inventory = payload["inventory"]
     if not inventory:
-        return "No medication inventory rows are available for the selected appointment."
+        return "No medication inventory rows are available for the current Neo4j forecast."
 
     text = question.lower()
     total_qty = payload["metrics"].get("quantityNeeded", 0)
@@ -745,15 +1515,14 @@ def fast_inventory_answer(question: str, payload: dict[str, Any]) -> str | None:
     appointment_reason = payload["appointmentReason"]
     species = payload.get("species", "all")
     life_stage = payload.get("lifeStage", "all")
-    forecast_scope = "day-1 only" if payload.get("forecastScope") == "day1" else "whole episode"
-    min_cases = payload.get("minCases", payload["metrics"].get("noiseFloor", 2))
+    is_aggregate = payload.get("forecastScope") == "all_future_inventory"
 
     wants_supplier = any(word in text for word in ["supplier", "vendor", "store", "price", "cost"])
     wants_quantity = any(
         word in text
         for word in ["medication", "medicine", "medications", "quantity", "qty", "need", "needed", "order", "purchase", "buy", "stock"]
     )
-    wants_source = any(word in text for word in ["why", "source", "from", "matched", "similar", "evidence", "appointment", "graph"])
+    wants_source = question_wants_source(text)
     wants_date = any(word in text for word in ["when", "date", "purchase by", "buy by"])
     wants_codex = any(word in text for word in ["codex", "deep", "deeper", "analyze", "analysis"])
 
@@ -761,40 +1530,40 @@ def fast_inventory_answer(question: str, payload: dict[str, Any]) -> str | None:
         return None
 
     if wants_supplier:
-        all_missing = all(
-            row["Supplier or Store"] == GRAPH_GAP_LABEL
-            and row["Price Paid"] == GRAPH_GAP_LABEL
-            for row in inventory
+        return (
+            f"Vendor selected: {payload.get('vendor', KG_VENDOR_OPTION)}. The price column shows expected historical "
+            "invoice cost from the matched past visits; exact vendor purchase prices still need the vendor quote/cart.\n\n"
+            + "\n".join(supplier_price_lines(inventory[:12]))
         )
-        if all_missing:
-            return (
-                "Supplier and price columns are present, but those values are missing from the KG for "
-                f"all {med_count} predicted medications.\n\n"
-                + "\n".join(supplier_price_lines(inventory))
-            )
-        return f"Supplier and price details for {payload.get('vendor', KG_VENDOR_OPTION)}:\n\n" + "\n".join(supplier_price_lines(inventory))
 
     if wants_source:
-        return (
-            f"The sheet is based on {similar_count} similar historical appointments matched by presentation sign tags "
-            f"for '{appointment_reason}'. Cohort: species {species}, life stage {life_stage}, scope {forecast_scope}, "
-            f"noise floor {min_cases} supporting cases. The KG contributed {evidence_count} historical medication rows, "
-            f"then the app rolled those into {med_count} medication inventory rows for the {appointment_date} appointment.\n\n"
-            "Predicted medications:\n"
-            + "\n".join(medication_quantity_lines(inventory))
-        )
+        return why_answer_for_line(question, payload, matching_forecast_line(question, payload))
 
     if wants_date:
+        if is_aggregate:
+            return (
+                f"Purchase by {purchase_date} for the upcoming appointment forecast period {appointment_date}.\n\n"
+                + "\n".join(medication_quantity_lines(inventory))
+            )
         return (
             f"Purchase by {purchase_date} for the {appointment_date} appointment.\n\n"
             + "\n".join(medication_quantity_lines(inventory))
         )
 
     if wants_quantity or len(text.split()) <= 6:
+        if is_aggregate:
+            forecast_count = payload["metrics"].get("forecastVisits", 0)
+            return (
+                f"For all upcoming appointments in {appointment_date}, prepare {med_count} medication/supply rows "
+                f"with {total_qty} purchase units. The forecast covers {forecast_count} future appointments and "
+                f"{evidence_count} KG evidence links. Purchase by {purchase_date}.\n\n"
+                + "\n".join(medication_quantity_lines(inventory[:14]))
+            )
         return (
-            f"For the {appointment_date} {appointment_reason}, prepare {med_count} medications "
-            f"with {total_qty} total units. Purchase by {purchase_date}.\n\n"
-            + "\n".join(medication_quantity_lines(inventory))
+            f"For {payload.get('pet', 'this patient')} on {appointment_date}, prepare {med_count} stockable medication/supply rows "
+            f"with {total_qty} purchase units. The forecast is based on {similar_count} similar invoice-backed appointments "
+            f"and {evidence_count} KG evidence links. Purchase by {purchase_date}.\n\n"
+            + "\n".join(medication_quantity_lines(inventory[:14]))
         )
 
     return None
@@ -925,26 +1694,28 @@ def text_lines_to_pdf_bytes(lines: list[str]) -> bytes:
 
 def inventory_pdf_bytes(payload: dict[str, Any]) -> bytes:
     inventory = payload["inventory"]
+    is_aggregate = payload.get("forecastScope") == "all_future_inventory"
     lines = [
         "Medication Inventory Tracker",
         f"Clinic: {payload['clinicName']}",
-        f"Appointment: {payload['appointmentReason']}",
-        f"Appointment Date: {payload['appointmentDate']}",
+        f"Forecast: {'All upcoming appointments' if is_aggregate else payload['appointmentReason']}",
+        f"{'Forecast Period' if is_aggregate else 'Appointment Date'}: {payload['appointmentDate']}",
         f"Purchase By: {payload['purchaseDate']}",
         f"Vendor: {payload.get('vendor', KG_VENDOR_OPTION)}",
         "",
     ]
     if not inventory:
-        lines.append("No medication inventory rows were predicted for this appointment.")
+        lines.append("No medication inventory rows were predicted for this forecast.")
     for index, row in enumerate(inventory, start=1):
         lines.append(f"{index}. {row['Medication Name']}")
         detail = (
             f"Product Type: {row['Product Type']} | Quantity Needed: {row['Quantity Needed']} | "
-            f"Unit Size: {row['Unit Size']} | Minimum Quantity: {row['Minimum Quantity']}"
+            f"Expected Units: {row.get('Expected Units', '')} | Unit Size: {row['Unit Size']} | "
+            f"Forecasted Appointments: {row.get('Forecasted Appointments', '')}"
         )
         purchase = (
             f"Date To Purchase: {row['Date To Purchase']} | Supplier or Store: {row['Supplier or Store']} | "
-            f"Price Paid: {row['Price Paid']}"
+            f"Expected Cost: {row.get('Expected Cost') or row.get('Price Paid')} | Cost Source: {row.get('Cost Source', '')}"
         )
         lines.extend(textwrap.wrap(detail, width=102))
         lines.extend(textwrap.wrap(purchase, width=102))
@@ -953,24 +1724,39 @@ def inventory_pdf_bytes(payload: dict[str, Any]) -> bytes:
 
 
 def inventory_df_from_payload(payload: dict[str, Any]) -> pd.DataFrame:
-    return pd.DataFrame(payload["inventory"])
+    visible_columns = [
+        "Medication Name",
+        "Product Type",
+        "Quantity Needed",
+        "Expected Units",
+        "Unit Size",
+        "Forecasted Appointments",
+        "Date To Purchase",
+        "Supplier or Store",
+        "Expected Cost",
+    ]
+    rows = []
+    for row in payload["inventory"]:
+        rows.append({column: row.get(column, "") for column in visible_columns})
+    return pd.DataFrame(rows, columns=visible_columns)
 
 
 def fallback_chat_answer(question: str, payload: dict[str, Any]) -> str:
     inventory = payload["inventory"]
     if not inventory:
-        return "No medication inventory rows are available for the selected appointment."
+        return "No medication inventory rows are available for the current Neo4j forecast."
     text = question.lower()
+    if question_wants_source(text):
+        return why_answer_for_line(question, payload, matching_forecast_line(question, payload))
     if any(word in text for word in ["supplier", "vendor", "store", "price", "cost"]):
-        if all(row["Supplier or Store"] == GRAPH_GAP_LABEL or row["Price Paid"] == GRAPH_GAP_LABEL for row in inventory):
-            return "Supplier and price columns are present, but the current KG rows do not include those values."
+        return f"Vendor selected: {payload.get('vendor', KG_VENDOR_OPTION)}. Exact vendor prices need quote/cart confirmation."
     if any(word in text for word in ["qty", "quantity", "order", "purchase", "needed"]):
         return "Quantity needed: " + "; ".join(
             f"{row['Medication Name']}: {row['Quantity Needed']} by {row['Date To Purchase']}"
             for row in inventory[:8]
         )
     return "Inventory rows: " + "; ".join(
-        f"{row['Medication Name']} quantity {row['Quantity Needed']}, supplier {row['Supplier or Store']}, price {row['Price Paid']}"
+        f"{row['Medication Name']} quantity {row['Quantity Needed']}, supplier {row['Supplier or Store']}, expected cost {row.get('Expected Cost') or row.get('Price Paid')}"
         for row in inventory[:8]
     )
 
@@ -1212,30 +1998,32 @@ def run_medvet_cart(items: list[dict[str, Any]], metadata: dict[str, str], visib
 def call_codex_cli(question: str, payload: dict[str, Any], history: list[dict[str, str]]) -> tuple[str, str]:
     context = {
         "clinic": payload["clinicName"],
+        "forecastId": payload.get("forecastId"),
+        "pet": payload.get("pet"),
         "appointmentReason": payload["appointmentReason"],
         "appointmentDate": payload["appointmentDate"],
         "purchaseDate": payload["purchaseDate"],
         "species": payload["species"],
         "lifeStage": payload["lifeStage"],
-        "forecastScope": payload["forecastScope"],
-        "includeProcedural": payload["includeProcedural"],
-        "minCases": payload["minCases"],
+        "forecastScope": payload.get("forecastScope", "future appointment complaint -> similar historical invoice-backed appointments"),
         "vendor": payload.get("vendor", KG_VENDOR_OPTION),
         "vendorOptions": payload.get("vendorOptions", VENDOR_OPTIONS),
         "vendorInvoice": payload.get("vendorInvoice", [])[:20],
         "forecastRules": payload["forecastRules"],
         "metrics": payload["metrics"],
         "inventory": payload["inventory"][:20],
+        "chargeLines": payload.get("chargeLines", [])[:40],
+        "inventoryRollup": payload.get("inventoryRollup", [])[:20],
         "provenance": payload["provenance"][:20],
-        "medicationEvidence": payload["medicationEvidence"][:30],
-        "similarAppointments": payload["similarAppointments"][:12],
+        "evidenceTrail": payload.get("evidenceTrail", [])[:12],
     }
     prompt = f"""
 You are the medication inventory assistant for {CLINIC_NAME}.
 
-Answer the user's question using only the KG-derived JSON context below.
-The context was built from Neo4j first, then passed to you through this Codex CLI loop.
-Do not invent supplier, price, stock, or vendor values. If a field says "{GRAPH_GAP_LABEL}", say it is missing from the graph.
+Answer the user's question using only the Neo4j-derived forecast and evidence context below.
+This dashboard uses Darshan's pipeline: future appointment complaints are embedded, similar historical appointments
+with real invoices are retrieved, invoice line items are aggregated into inventory demand, and EVIDENCED_BY edges explain the "why" trail.
+Do not invent supplier, price, stock, or vendor values. If a field says "{GRAPH_GAP_LABEL}", say it is missing or not loaded.
 Keep the answer short and operational.
 
 Recent chat:
@@ -1250,18 +2038,22 @@ User question: {question}
     with tempfile.NamedTemporaryFile("w+", suffix=".txt", delete=False) as output_file:
         output_path = output_file.name
     try:
+        command = [
+            "codex",
+            "exec",
+            "--skip-git-repo-check",
+            "--ephemeral",
+            "--sandbox",
+            "read-only",
+            "--output-last-message",
+            output_path,
+        ]
+        codex_model = clean_text(os.getenv("CODEX_CHAT_MODEL") or os.getenv("CODEX_MODEL"))
+        if codex_model:
+            command.extend(["--model", codex_model])
+        command.append("-")
         result = subprocess.run(
-            [
-                "codex",
-                "exec",
-                "--skip-git-repo-check",
-                "--ephemeral",
-                "--sandbox",
-                "read-only",
-                "--output-last-message",
-                output_path,
-                "-",
-            ],
+            command,
             input=prompt,
             text=True,
             cwd=str(BASE_DIR),
@@ -1283,19 +2075,33 @@ User question: {question}
 
 
 async def api_bootstrap(_request) -> JSONResponse:
-    min_date, max_date = get_episode_date_bounds()
-    cohort_options = get_species_life_stage_options()
+    options = load_kg_forecast_options()
+    dates = [parse_date(option.get("date")) for option in options]
+    dates = [item for item in dates if item is not None]
+    min_date = min(dates) if dates else date.today()
+    max_date = max(dates) if dates else date.today() + timedelta(days=28)
+    species = sorted({clean_text(option.get("species")) for option in options if clean_text(option.get("species"))})
+    life_stages: dict[str, list[str]] = {"all": ["all"]}
+    for option in options:
+        species_name = clean_text(option.get("species"))
+        stage = clean_text(option.get("lifeStage"))
+        if species_name and stage:
+            life_stages.setdefault(species_name, ["all"])
+            if stage not in life_stages[species_name]:
+                life_stages[species_name].append(stage)
     return JSONResponse(
         {
             "clinicName": CLINIC_NAME,
-            "suggestions": get_appointment_suggestions(),
-            "species": cohort_options["species"],
-            "lifeStages": cohort_options["lifeStages"],
+            "forecastOptions": options,
+            "defaultForecastId": options[0]["id"] if options else "",
+            "suggestions": [option["complaint"] for option in options[:30]],
+            "species": ["all", *species] if species else ["all", "canine", "feline"],
+            "lifeStages": life_stages,
             "minHistoryDate": min_date.isoformat(),
             "maxHistoryDate": max_date.isoformat(),
-            "defaultHistoryStart": max(min_date, max_date - timedelta(days=540)).isoformat(),
-            "defaultAppointmentDate": (date.today() + timedelta(days=7)).isoformat(),
-            "graph": get_graph_health(),
+            "defaultHistoryStart": min_date.isoformat(),
+            "defaultAppointmentDate": options[0]["date"] if options else (date.today() + timedelta(days=7)).isoformat(),
+            "graph": strict_graph_health(),
             "vendorOptions": VENDOR_OPTIONS,
         }
     )
@@ -1353,7 +2159,7 @@ async def api_vendor_cart(request) -> JSONResponse:
 async def api_export(request) -> Response:
     export_type = request.path_params["export_type"]
     payload, _cached = get_inventory_payload(await request.json())
-    stem = f"florida_plantation_medication_inventory_{slugify(payload.get('vendor'))}_{payload['appointmentDate']}"
+    stem = f"florida_plantation_medication_inventory_{slugify(payload.get('vendor'))}_{slugify(payload['appointmentDate'])}"
     df = inventory_df_from_payload(payload)
     if export_type == "csv":
         buffer = io.StringIO()
