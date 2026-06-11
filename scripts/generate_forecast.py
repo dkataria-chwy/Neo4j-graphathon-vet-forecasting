@@ -65,18 +65,26 @@ def main():
     forecasts, evidence_pairs = [], []
 
     for n, f in enumerate(futures):
-        # 2. similar historical appointments (same species, prefer same life_stage, has invoice)
-        nbrs = q("""
-            MATCH (a:Appointment {appointment_id:$aid})
-            CALL db.index.vector.queryNodes('appointment_complaint_idx', 150, a.complaintEmbedding)
-            YIELD node, score
-            MATCH (p:Patient)-[:HAS_APPOINTMENT]->(node)
-            WHERE coalesce(node.is_future,false)=false AND p.species=$sp
-              AND EXISTS { (node)-[:HAS_INVOICE]->(:Invoice) }
-            RETURN node.appointment_id AS aid, node.chief_complaint AS cc, score,
-                   (p.life_stage=$ls) AS same_stage
-            ORDER BY same_stage DESC, score DESC LIMIT $k
-        """, aid=f["aid"], sp=f["sp"], ls=f["ls"], k=args.k)
+        # 2. PRE-FILTER to the cohort (species + life_stage + has invoice), THEN cosine.
+        #    Every species x life_stage cohort is >=125 visits, so hard-filtering both never
+        #    starves; fall back to species-only if a cohort is ever unexpectedly thin.
+        def retrieve(use_life_stage):
+            cohort = "{species:$sp, life_stage:$ls}" if use_life_stage else "{species:$sp}"
+            return q(f"""
+                MATCH (fa:Appointment {{appointment_id:$aid}})
+                WITH fa.complaintEmbedding AS qvec
+                MATCH (p:Patient {cohort})-[:HAS_APPOINTMENT]->(node:Appointment)
+                WHERE node.complaintEmbedding IS NOT NULL
+                  AND coalesce(node.is_future,false) = false
+                  AND EXISTS {{ (node)-[:HAS_INVOICE]->(:Invoice) }}
+                WITH node, vector.similarity.cosine(node.complaintEmbedding, qvec) AS score
+                RETURN node.appointment_id AS aid, node.chief_complaint AS cc, score
+                ORDER BY score DESC LIMIT $k
+            """, aid=f["aid"], sp=f["sp"], ls=f["ls"], k=args.k)
+
+        nbrs = retrieve(use_life_stage=True)
+        if len(nbrs) < args.k:                      # cohort too thin -> relax life_stage
+            nbrs = retrieve(use_life_stage=False)
         if not nbrs:
             continue
         K = len(nbrs)
