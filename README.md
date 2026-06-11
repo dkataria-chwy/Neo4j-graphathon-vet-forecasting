@@ -39,3 +39,16 @@ TARGET_NEO4J_URI=...  TARGET_NEO4J_USERNAME=neo4j  TARGET_NEO4J_PASSWORD=... \
 - `scripts/export_patient_graph.py` — how the dump was produced (reads the source KG).
 - `data/` — the dump (`patient_graph/` + tarball), local only.
 - `CLAUDE.md` — project brief + KG schema + the canonical traversal query + forecast hygiene.
+
+## React inventory dashboard
+
+The React dashboard is served by a small Starlette backend:
+
+```bash
+python3 -m venv .venv
+./.venv/bin/pip install -r requirements.txt
+cp .env.example .env  # fill local Neo4j credentials; do not commit this file
+./.venv/bin/python -m uvicorn react_backend:app --host 127.0.0.1 --port 8520
+```
+
+Open `http://127.0.0.1:8520` to forecast the medication inventory sheet, export it, use the KG chat, and prepare a three-line Med-Vet cart preview.
