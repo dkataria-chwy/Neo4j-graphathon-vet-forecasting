@@ -34,7 +34,7 @@ var emptyMetrics = {
   fourWeekStockItems: 0,
   database: "neo4j"
 };
-var defaultVendors = ["Amazon", "Chewy", "Covetrus", "MWI", "Patterson", "Med-Vet International", "Use KG supplier"];
+var defaultVendors = ["Amazon", "Chewy", "Covetrus", "MWI", "Patterson", "Med-Vet International"];
 function todayPlus(days) {
   var value = new Date();
   value.setDate(value.getDate() + days);
@@ -62,6 +62,9 @@ function fileStem(filters, payload) {
   var vendor = (filters.vendor || "vendor").toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
   var period = (payload.appointmentDate || "all_future").replace(/[^a-z0-9]+/gi, "_").replace(/^_|_$/g, "");
   return "florida_plantation_inventory_".concat(vendor, "_").concat(period);
+}
+function vendorLabel(vendor) {
+  return vendor === "Use KG supplier" ? "Recorded supplier" : vendor;
 }
 function App() {
   var _payload$inventory, _bootstrap$forecastOp, _cartResult$results;
@@ -132,7 +135,9 @@ function App() {
     return filters;
   }, [filters]);
   var metrics = payload.metrics || emptyMetrics;
-  var vendorOptions = payload.vendorOptions || (bootstrap === null || bootstrap === void 0 ? void 0 : bootstrap.vendorOptions) || defaultVendors;
+  var vendorOptions = (payload.vendorOptions || (bootstrap === null || bootstrap === void 0 ? void 0 : bootstrap.vendorOptions) || defaultVendors).filter(function (vendor) {
+    return vendor !== "Use KG supplier";
+  });
   var hasRows = ((_payload$inventory = payload.inventory) === null || _payload$inventory === void 0 ? void 0 : _payload$inventory.length) > 0;
   var selectedVendor = payload.vendor || filters.vendor || "Med-Vet International";
   var vendorInvoice = payload.vendorInvoice || [];
@@ -439,17 +444,15 @@ function App() {
     className: "hero"
   }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
     className: "eyebrow"
-  }, payload.clinicName || "Florida Plantation Clinic"), /*#__PURE__*/React.createElement("h1", null, "Forecast Charge Sheet"), /*#__PURE__*/React.createElement("p", null, "Clinic-level medication inventory from all upcoming appointments, similar historical invoices, and a KG-backed why trail.")), /*#__PURE__*/React.createElement("div", {
-    className: "heroBadge"
-  }, /*#__PURE__*/React.createElement("span", null, "KG"), /*#__PURE__*/React.createElement("strong", null, metrics.database || "neo4j"))), /*#__PURE__*/React.createElement("section", {
+  }, payload.clinicName || "Florida Plantation Clinic"), /*#__PURE__*/React.createElement("h1", null, "Medication Inventory"))), /*#__PURE__*/React.createElement("section", {
     className: "controls"
   }, /*#__PURE__*/React.createElement("div", {
     className: "controlHeading"
-  }, "Forecast scope"), /*#__PURE__*/React.createElement("div", {
+  }, "Inventory Settings"), /*#__PURE__*/React.createElement("div", {
     className: "targetGrid"
   }, /*#__PURE__*/React.createElement("div", {
     className: "scopeCard"
-  }, /*#__PURE__*/React.createElement("b", null, "All upcoming appointments"), /*#__PURE__*/React.createElement("span", null, forecastCount, " forecast targets \xB7 ", metrics.kgEvidence || 0, " EVIDENCED_BY links \xB7 Neo4j only")), /*#__PURE__*/React.createElement("label", null, "Vendor invoice", /*#__PURE__*/React.createElement("select", {
+  }, /*#__PURE__*/React.createElement("b", null, "Forecast Period"), /*#__PURE__*/React.createElement("span", null, forecastPeriod || "-")), /*#__PURE__*/React.createElement("label", null, "Vendor", /*#__PURE__*/React.createElement("select", {
     value: filters.vendor,
     onChange: function onChange(event) {
       return updateFilter("vendor", event.target.value);
@@ -458,46 +461,42 @@ function App() {
     return /*#__PURE__*/React.createElement("option", {
       key: vendor,
       value: vendor
-    }, vendor);
+    }, vendorLabel(vendor));
   })))), /*#__PURE__*/React.createElement("div", {
     className: "appointmentSummary"
-  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("b", null, "Clinic"), /*#__PURE__*/React.createElement("span", null, payload.clinicName || "Florida Plantation Clinic")), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("b", null, "Period"), /*#__PURE__*/React.createElement("span", null, forecastPeriod || "-")), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("b", null, "Demand"), /*#__PURE__*/React.createElement("span", null, metrics.quantityNeeded || 0, " units")), /*#__PURE__*/React.createElement("div", {
-    className: "summaryWide"
-  }, /*#__PURE__*/React.createElement("b", null, "Source"), /*#__PURE__*/React.createElement("span", null, "Future appointments matched to historical invoice items in Neo4j")))), error ? /*#__PURE__*/React.createElement("div", {
+  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("b", null, "Clinic"), /*#__PURE__*/React.createElement("span", null, payload.clinicName || "Florida Plantation Clinic")), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("b", null, "Period"), /*#__PURE__*/React.createElement("span", null, forecastPeriod || "-")), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("b", null, "Demand"), /*#__PURE__*/React.createElement("span", null, metrics.quantityNeeded || 0, " units")), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("b", null, "Vendor"), /*#__PURE__*/React.createElement("span", null, vendorLabel(selectedVendor))))), error ? /*#__PURE__*/React.createElement("div", {
     className: "error"
   }, error) : null, /*#__PURE__*/React.createElement("section", {
     className: "metrics"
   }, /*#__PURE__*/React.createElement(Metric, {
-    label: "Upcoming appointments",
+    label: "Appointments",
     value: forecastCount,
-    detail: "".concat(metrics.kgEvidence || 0, " KG evidence links"),
-    color: "#2563eb"
+    detail: "scheduled visits",
+    color: "#17437a"
   }), /*#__PURE__*/React.createElement(Metric, {
     label: "Inventory rows",
     value: metrics.medications,
     detail: "".concat(metrics.quantityNeeded || 0, " units to prepare"),
-    color: "#0f766e"
+    color: "#17437a"
   }), /*#__PURE__*/React.createElement(Metric, {
     label: "Expected billing",
     value: money(metrics.expectedTotalCost),
-    detail: "forecasted across schedule",
-    color: "#475569",
+    detail: "estimated total",
+    color: "#17437a",
     small: true
   })), /*#__PURE__*/React.createElement("section", {
     className: "sheetTop"
-  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("h2", null, "Medication inventory sheet"), /*#__PURE__*/React.createElement("p", null, payload.clinicName, " \xB7 all upcoming appointments \xB7 ", selectedVendor, " \xB7 purchase by ", payload.purchaseDate)), /*#__PURE__*/React.createElement("span", {
-    className: hasRows ? "status ready" : "status"
-  }, hasRows ? "Ready to export" : "No rows to export")), /*#__PURE__*/React.createElement("section", {
+  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("h2", null, "Inventory Sheet"))), /*#__PURE__*/React.createElement("section", {
     className: "sheet"
   }, /*#__PURE__*/React.createElement("div", {
     className: "sheetHeader"
-  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("h3", null, "Medication Inventory Tracker"), /*#__PURE__*/React.createElement("p", null, "All upcoming appointments \xB7 ", forecastPeriod)), /*#__PURE__*/React.createElement("strong", null, "Purchase by ", payload.purchaseDate)), /*#__PURE__*/React.createElement("div", {
+  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("h3", null, "Medication Inventory Tracker")), /*#__PURE__*/React.createElement("strong", null, "Purchase date ", payload.purchaseDate)), /*#__PURE__*/React.createElement("div", {
     className: "metaRows"
-  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("b", null, "Clinic"), /*#__PURE__*/React.createElement("span", null, payload.clinicName)), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("b", null, "Forecast Period"), /*#__PURE__*/React.createElement("span", null, forecastPeriod)), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("b", null, "Forecast Source"), /*#__PURE__*/React.createElement("span", null, forecastCount, " upcoming appointments")), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("b", null, "Vendor"), /*#__PURE__*/React.createElement("span", null, selectedVendor))), /*#__PURE__*/React.createElement(InventoryTable, {
+  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("b", null, "Clinic"), /*#__PURE__*/React.createElement("span", null, payload.clinicName)), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("b", null, "Period"), /*#__PURE__*/React.createElement("span", null, forecastPeriod)), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("b", null, "Appointments"), /*#__PURE__*/React.createElement("span", null, forecastCount)), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("b", null, "Vendor"), /*#__PURE__*/React.createElement("span", null, vendorLabel(selectedVendor)))), /*#__PURE__*/React.createElement(InventoryTable, {
     rows: payload.inventory || [],
     loading: loading
-  })), /*#__PURE__*/React.createElement("section", {
-    className: "exportBar"
+  }), /*#__PURE__*/React.createElement("div", {
+    className: "sheetExport"
   }, /*#__PURE__*/React.createElement("div", {
     className: "exportTitle"
   }, "Export inventory sheet"), /*#__PURE__*/React.createElement("div", {
@@ -517,7 +516,7 @@ function App() {
     onClick: function onClick() {
       return exportSheet("csv");
     }
-  }, "CSV"), /*#__PURE__*/React.createElement("span", null, "Exports use all upcoming appointment forecast rows and the selected vendor."))), /*#__PURE__*/React.createElement("section", {
+  }, "CSV")))), /*#__PURE__*/React.createElement("section", {
     className: "evidence"
   }, /*#__PURE__*/React.createElement(EvidenceCards, {
     rows: payload.evidenceTrail || []
@@ -527,7 +526,11 @@ function App() {
     className: "vendorToolbar"
   }, /*#__PURE__*/React.createElement("div", {
     className: "vendorSelector"
-  }, /*#__PURE__*/React.createElement("b", null, selectedVendor, " invoice"), /*#__PURE__*/React.createElement("span", null, "Showing ", Math.min(3, vendorInvoice.length || 0), " of ", vendorInvoice.length || 0, " rows \xB7 ", payload.vendorWebsite || "KG supplier")), /*#__PURE__*/React.createElement("button", {
+  }, /*#__PURE__*/React.createElement("b", null, vendorLabel(selectedVendor), " invoice"), /*#__PURE__*/React.createElement("span", null, "Showing ", Math.min(3, vendorInvoice.length || 0), " of ", vendorInvoice.length || 0, " rows \xB7 ", payload.vendorWebsite || "recorded supplier"))), /*#__PURE__*/React.createElement(VendorInvoiceTable, {
+    rows: vendorPreview
+  }), /*#__PURE__*/React.createElement("div", {
+    className: "vendorActions"
+  }, /*#__PURE__*/React.createElement("button", {
     disabled: !hasRows || cartBusy,
     onClick: function onClick() {
       return createVendorCart(false, false);
@@ -537,9 +540,7 @@ function App() {
     onClick: function onClick() {
       return createVendorCart(true, true);
     }
-  }, "Open website and add cart")), /*#__PURE__*/React.createElement(VendorInvoiceTable, {
-    rows: vendorPreview
-  }), cartResult ? /*#__PURE__*/React.createElement("div", {
+  }, "Open website and add cart")), cartResult ? /*#__PURE__*/React.createElement("div", {
     className: "cartResult ".concat(cartResult.status || "")
   }, /*#__PURE__*/React.createElement("b", null, cartStatusLabel), /*#__PURE__*/React.createElement("span", null, cartResult.message), (_cartResult$results = cartResult.results) !== null && _cartResult$results !== void 0 && _cartResult$results.length ? /*#__PURE__*/React.createElement("div", {
     className: "cartResultList"
@@ -631,7 +632,7 @@ function EvidenceCards(_ref4) {
       className: "evidenceCards"
     }, /*#__PURE__*/React.createElement("div", {
       className: "evidenceCard"
-    }, /*#__PURE__*/React.createElement("b", null, "KG evidence"), /*#__PURE__*/React.createElement("p", null, "No evidence rows are available from Neo4j.")));
+    }, /*#__PURE__*/React.createElement("b", null, "Evidence"), /*#__PURE__*/React.createElement("p", null, "No evidence rows are available.")));
   }
   return /*#__PURE__*/React.createElement("section", {
     className: "evidenceCards"
@@ -682,8 +683,8 @@ function ChatWidget(_ref6) {
     sendMessage = _ref6.sendMessage,
     busy = _ref6.busy;
   function sourceLabel(source) {
-    if (source === "kg-fast-cache") return "KG cache";
-    if (source === "kg-fast") return "KG";
+    if (source === "kg-fast-cache") return "Cached data";
+    if (source === "kg-fast") return "Data";
     if (source === "codex") return "Codex";
     return source;
   }

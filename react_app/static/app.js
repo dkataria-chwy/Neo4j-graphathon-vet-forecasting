@@ -12,7 +12,7 @@ const emptyMetrics = {
   database: "neo4j",
 };
 
-const defaultVendors = ["Amazon", "Chewy", "Covetrus", "MWI", "Patterson", "Med-Vet International", "Use KG supplier"];
+const defaultVendors = ["Amazon", "Chewy", "Covetrus", "MWI", "Patterson", "Med-Vet International"];
 
 function todayPlus(days) {
   const value = new Date();
@@ -41,6 +41,10 @@ function fileStem(filters, payload) {
   const vendor = (filters.vendor || "vendor").toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
   const period = (payload.appointmentDate || "all_future").replace(/[^a-z0-9]+/gi, "_").replace(/^_|_$/g, "");
   return `florida_plantation_inventory_${vendor}_${period}`;
+}
+
+function vendorLabel(vendor) {
+  return vendor === "Use KG supplier" ? "Recorded supplier" : vendor;
 }
 
 function App() {
@@ -79,7 +83,9 @@ function App() {
 
   const requestFilters = useMemo(() => filters, [filters]);
   const metrics = payload.metrics || emptyMetrics;
-  const vendorOptions = payload.vendorOptions || bootstrap?.vendorOptions || defaultVendors;
+  const vendorOptions = (payload.vendorOptions || bootstrap?.vendorOptions || defaultVendors).filter(
+    (vendor) => vendor !== "Use KG supplier"
+  );
   const hasRows = payload.inventory?.length > 0;
   const selectedVendor = payload.vendor || filters.vendor || "Med-Vet International";
   const vendorInvoice = payload.vendorInvoice || [];
@@ -216,29 +222,22 @@ function App() {
       <section className="hero">
         <div>
           <div className="eyebrow">{payload.clinicName || "Florida Plantation Clinic"}</div>
-          <h1>Forecast Charge Sheet</h1>
-          <p>
-            Clinic-level medication inventory from all upcoming appointments, similar historical invoices, and a KG-backed why trail.
-          </p>
-        </div>
-        <div className="heroBadge">
-          <span>KG</span>
-          <strong>{metrics.database || "neo4j"}</strong>
+          <h1>Medication Inventory</h1>
         </div>
       </section>
 
       <section className="controls">
-        <div className="controlHeading">Forecast scope</div>
+        <div className="controlHeading">Inventory Settings</div>
         <div className="targetGrid">
           <div className="scopeCard">
-            <b>All upcoming appointments</b>
-            <span>{forecastCount} forecast targets · {metrics.kgEvidence || 0} EVIDENCED_BY links · Neo4j only</span>
+            <b>Forecast Period</b>
+            <span>{forecastPeriod || "-"}</span>
           </div>
           <label>
-            Vendor invoice
+            Vendor
             <select value={filters.vendor} onChange={(event) => updateFilter("vendor", event.target.value)}>
               {vendorOptions.map((vendor) => (
-                <option key={vendor} value={vendor}>{vendor}</option>
+                <option key={vendor} value={vendor}>{vendorLabel(vendor)}</option>
               ))}
             </select>
           </label>
@@ -247,52 +246,45 @@ function App() {
           <div><b>Clinic</b><span>{payload.clinicName || "Florida Plantation Clinic"}</span></div>
           <div><b>Period</b><span>{forecastPeriod || "-"}</span></div>
           <div><b>Demand</b><span>{metrics.quantityNeeded || 0} units</span></div>
-          <div className="summaryWide"><b>Source</b><span>Future appointments matched to historical invoice items in Neo4j</span></div>
+          <div><b>Vendor</b><span>{vendorLabel(selectedVendor)}</span></div>
         </div>
       </section>
 
       {error ? <div className="error">{error}</div> : null}
 
       <section className="metrics">
-        <Metric label="Upcoming appointments" value={forecastCount} detail={`${metrics.kgEvidence || 0} KG evidence links`} color="#2563eb" />
-        <Metric label="Inventory rows" value={metrics.medications} detail={`${metrics.quantityNeeded || 0} units to prepare`} color="#0f766e" />
-        <Metric label="Expected billing" value={money(metrics.expectedTotalCost)} detail="forecasted across schedule" color="#475569" small />
+        <Metric label="Appointments" value={forecastCount} detail="scheduled visits" color="#17437a" />
+        <Metric label="Inventory rows" value={metrics.medications} detail={`${metrics.quantityNeeded || 0} units to prepare`} color="#17437a" />
+        <Metric label="Expected billing" value={money(metrics.expectedTotalCost)} detail="estimated total" color="#17437a" small />
       </section>
 
       <section className="sheetTop">
         <div>
-          <h2>Medication inventory sheet</h2>
-          <p>
-            {payload.clinicName} · all upcoming appointments · {selectedVendor} · purchase by {payload.purchaseDate}
-          </p>
+          <h2>Inventory Sheet</h2>
         </div>
-        <span className={hasRows ? "status ready" : "status"}>{hasRows ? "Ready to export" : "No rows to export"}</span>
       </section>
 
       <section className="sheet">
         <div className="sheetHeader">
           <div>
             <h3>Medication Inventory Tracker</h3>
-            <p>All upcoming appointments · {forecastPeriod}</p>
           </div>
-          <strong>Purchase by {payload.purchaseDate}</strong>
+          <strong>Purchase date {payload.purchaseDate}</strong>
         </div>
         <div className="metaRows">
           <div><b>Clinic</b><span>{payload.clinicName}</span></div>
-          <div><b>Forecast Period</b><span>{forecastPeriod}</span></div>
-          <div><b>Forecast Source</b><span>{forecastCount} upcoming appointments</span></div>
-          <div><b>Vendor</b><span>{selectedVendor}</span></div>
+          <div><b>Period</b><span>{forecastPeriod}</span></div>
+          <div><b>Appointments</b><span>{forecastCount}</span></div>
+          <div><b>Vendor</b><span>{vendorLabel(selectedVendor)}</span></div>
         </div>
         <InventoryTable rows={payload.inventory || []} loading={loading} />
-      </section>
-
-      <section className="exportBar">
-        <div className="exportTitle">Export inventory sheet</div>
-        <div className="exportActions">
-          <button disabled={!hasRows} onClick={() => exportSheet("pdf")}>PDF</button>
-          <button disabled={!hasRows} onClick={() => exportSheet("xlsx")}>Excel</button>
-          <button disabled={!hasRows} onClick={() => exportSheet("csv")}>CSV</button>
-          <span>Exports use all upcoming appointment forecast rows and the selected vendor.</span>
+        <div className="sheetExport">
+          <div className="exportTitle">Export inventory sheet</div>
+          <div className="exportActions">
+            <button disabled={!hasRows} onClick={() => exportSheet("pdf")}>PDF</button>
+            <button disabled={!hasRows} onClick={() => exportSheet("xlsx")}>Excel</button>
+            <button disabled={!hasRows} onClick={() => exportSheet("csv")}>CSV</button>
+          </div>
         </div>
       </section>
 
@@ -303,15 +295,17 @@ function App() {
       <section className="vendorPanel">
         <div className="vendorToolbar">
           <div className="vendorSelector">
-            <b>{selectedVendor} invoice</b>
+            <b>{vendorLabel(selectedVendor)} invoice</b>
             <span>
-              Showing {Math.min(3, vendorInvoice.length || 0)} of {vendorInvoice.length || 0} rows · {payload.vendorWebsite || "KG supplier"}
+              Showing {Math.min(3, vendorInvoice.length || 0)} of {vendorInvoice.length || 0} rows · {payload.vendorWebsite || "recorded supplier"}
             </span>
           </div>
+        </div>
+        <VendorInvoiceTable rows={vendorPreview} />
+        <div className="vendorActions">
           <button disabled={!hasRows || cartBusy} onClick={() => createVendorCart(false, false)}>Create cart draft</button>
           <button disabled={!hasRows || cartBusy} onClick={() => createVendorCart(true, true)}>Open website and add cart</button>
         </div>
-        <VendorInvoiceTable rows={vendorPreview} />
         {cartResult ? (
           <div className={`cartResult ${cartResult.status || ""}`}>
             <b>{cartStatusLabel}</b>
@@ -419,8 +413,8 @@ function EvidenceCards({ rows }) {
     return (
       <section className="evidenceCards">
         <div className="evidenceCard">
-          <b>KG evidence</b>
-          <p>No evidence rows are available from Neo4j.</p>
+          <b>Evidence</b>
+          <p>No evidence rows are available.</p>
         </div>
       </section>
     );
@@ -478,8 +472,8 @@ function EvidenceTable({ title, rows }) {
 
 function ChatWidget({ open, setOpen, messages, chatInput, setChatInput, sendMessage, busy }) {
   function sourceLabel(source) {
-    if (source === "kg-fast-cache") return "KG cache";
-    if (source === "kg-fast") return "KG";
+    if (source === "kg-fast-cache") return "Cached data";
+    if (source === "kg-fast") return "Data";
     if (source === "codex") return "Codex";
     return source;
   }
