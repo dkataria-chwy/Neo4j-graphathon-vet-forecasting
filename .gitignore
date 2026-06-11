@@ -13,8 +13,7 @@ __pycache__/
 data/patient_graph/
 data/*.tar.gz
 
-# generated forecast output (regenerable; may contain pet names)
-out/
+# NOTE: out/ (generated forecast output) is committed on purpose — see commits.
 
 # os / editor
 .DS_Store
